@@ -30,11 +30,9 @@ static void SwizzleMethod(Class cls, SEL origSel, SEL swizSel) {
 static NSString *const kPrefGroupModeKey = @"ZaloNotif_GroupMode";
 
 /*
- Các chế độ gom nhóm (Group Modes):
- Mode 0: 👥 Tách riêng từng Cá nhân & Nhóm chat (Mỗi người/nhóm 1 xấp riêng) [Mặc định]
- Mode 1: 📦 Gom tất cả thông báo Zalo vào chung 1 xấp duy nhất
- Mode 2: ⏱️ Không gom cụm (Hiển thị từng tin riêng lẻ theo thời gian)
- Mode 3: 💬 Chỉ gom nhóm chat, tin cá nhân để riêng lẻ
+ 2 Chế độ gom nhóm theo đúng yêu cầu:
+ Mode 0: 👥 Gom theo nhóm (Cá nhân, nhóm chat) - Giữ nguyên vị trí [Mặc định]
+ Mode 1: ⏱️ Không gom gì hết (Theo thứ tự thời gian)
 */
 
 @interface ZKSettingsWindow : UIWindow
@@ -87,30 +85,18 @@ static void ShowGroupingSettings(void) {
         NSInteger currentMode = [[NSUserDefaults standardUserDefaults] integerForKey:kPrefGroupModeKey];
 
         UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"⚙️ Cài đặt Gom Thông Báo Zalo"
-                                                                       message:@"Chọn cách sắp xếp và gom cụm thông báo trên Màn hình khóa (Lockscreen):"
+                                                                       message:@"Chọn cách hiển thị thông báo trên Màn hình khóa (Lockscreen):"
                                                                 preferredStyle:UIAlertControllerStyleActionSheet];
 
-        NSString *title0 = [NSString stringWithFormat:@"%@ 👥 Tách riêng từng Cá nhân & Nhóm chat", currentMode == 0 ? @"✅" : @"   "];
+        NSString *title0 = [NSString stringWithFormat:@"%@ 👥 Gom theo nhóm (Cá nhân, nhóm chat)", currentMode == 0 ? @"✅" : @"   "];
         [alert addAction:[UIAlertAction actionWithTitle:title0 style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
             [[NSUserDefaults standardUserDefaults] setInteger:0 forKey:kPrefGroupModeKey];
             [[NSUserDefaults standardUserDefaults] synchronize];
         }]];
 
-        NSString *title1 = [NSString stringWithFormat:@"%@ 📦 Gom tất cả vào 1 mục Zalo chung", currentMode == 1 ? @"✅" : @"   "];
+        NSString *title1 = [NSString stringWithFormat:@"%@ ⏱️ Không gom gì hết (Theo thứ tự thời gian)", currentMode == 1 ? @"✅" : @"   "];
         [alert addAction:[UIAlertAction actionWithTitle:title1 style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
             [[NSUserDefaults standardUserDefaults] setInteger:1 forKey:kPrefGroupModeKey];
-            [[NSUserDefaults standardUserDefaults] synchronize];
-        }]];
-
-        NSString *title2 = [NSString stringWithFormat:@"%@ ⏱️ Không gom cụm (Hiển thị từng tin riêng lẻ)", currentMode == 2 ? @"✅" : @"   "];
-        [alert addAction:[UIAlertAction actionWithTitle:title2 style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-            [[NSUserDefaults standardUserDefaults] setInteger:2 forKey:kPrefGroupModeKey];
-            [[NSUserDefaults standardUserDefaults] synchronize];
-        }]];
-
-        NSString *title3 = [NSString stringWithFormat:@"%@ 💬 Chỉ gom nhóm chat, cá nhân để riêng", currentMode == 3 ? @"✅" : @"   "];
-        [alert addAction:[UIAlertAction actionWithTitle:title3 style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-            [[NSUserDefaults standardUserDefaults] setInteger:3 forKey:kPrefGroupModeKey];
             [[NSUserDefaults standardUserDefaults] synchronize];
         }]];
 
@@ -241,59 +227,6 @@ static void EnsureSettingsWindow(void) {
 
 @end
 
-// Hàm tính toán threadIdentifier dựa trên mode đã chọn
-static NSString *zk_determineThreadIdentifier(UNNotificationContent *content) {
-    NSInteger mode = [[NSUserDefaults standardUserDefaults] integerForKey:kPrefGroupModeKey];
-    NSDictionary *userInfo = content.userInfo;
-
-    if (mode == 1) {
-        // Mode 1: Gom tất cả thông báo Zalo vào chung 1 xấp duy nhất
-        return @"com.vng.zalo.all";
-    }
-
-    if (mode == 2) {
-        // Mode 2: Không gom cụm, mỗi tin nhắn là 1 stack riêng biệt theo thời gian
-        return [[NSUUID UUID] UUIDString];
-    }
-
-    NSString *groupId = nil;
-    NSString *userUid = nil;
-
-    if (userInfo) {
-        if (userInfo[@"grid"] && [userInfo[@"grid"] description].length > 0) {
-            groupId = [NSString stringWithFormat:@"group_%@", userInfo[@"grid"]];
-        } else if (userInfo[@"conv_id"] && [userInfo[@"conv_id"] description].length > 0) {
-            groupId = [NSString stringWithFormat:@"conv_%@", userInfo[@"conv_id"]];
-        }
-
-        if (userInfo[@"from_uid"] && [userInfo[@"from_uid"] description].length > 0) {
-            userUid = [NSString stringWithFormat:@"user_%@", userInfo[@"from_uid"]];
-        } else if (userInfo[@"uid"] && [userInfo[@"uid"] description].length > 0) {
-            userUid = [NSString stringWithFormat:@"user_%@", userInfo[@"uid"]];
-        }
-    }
-
-    if (mode == 3) {
-        // Mode 3: Chỉ gom nhóm chat, tin cá nhân để riêng lẻ
-        if (groupId) return groupId;
-        return [[NSUUID UUID] UUIDString];
-    }
-
-    // Mode 0 (Mặc định): Tách riêng từng cá nhân và từng nhóm chat
-    if (groupId) return groupId;
-    if (userUid) return userUid;
-
-    if (content.threadIdentifier && content.threadIdentifier.length > 0) {
-        return content.threadIdentifier;
-    }
-
-    if (content.title.length > 0) {
-        return [NSString stringWithFormat:@"zalo_chat_%lu", (unsigned long)[content.title hash]];
-    }
-
-    return @"zalo_general";
-}
-
 // ==========================================
 // 1. CHẶN XÓA THÔNG BÁO TỪ UNUserNotificationCenter
 // ==========================================
@@ -351,31 +284,45 @@ static NSString *zk_determineThreadIdentifier(UNNotificationContent *content) {
 // 3. TẠO BẢN SAO CONTENT HOÀN HẢO (KHÔNG BANNER / KHÔNG SOUND)
 // ==========================================
 static UNMutableNotificationContent *zk_prepareContentCopy(UNNotificationContent *origContent) {
-    UNMutableNotificationContent *newContent = [[UNMutableNotificationContent alloc] init];
+    UNMutableNotificationContent *mc = [origContent mutableCopy];
+    mc.sound = nil; // Tắt âm thanh để không rung/chuông khi khôi phục
+    mc.attachments = @[]; // Tránh lỗi file temp attachments
 
-    newContent.title = origContent.title ?: @"";
-    newContent.subtitle = origContent.subtitle ?: @"";
-    newContent.body = origContent.body ?: @"";
-    newContent.categoryIdentifier = origContent.categoryIdentifier ?: @"";
-    newContent.attachments = origContent.attachments ?: @[];
+    // Chống sáng màn hình và chống bung popup
+    @try { [mc setValue:@YES forKey:@"shouldSuppressScreenLightUp"]; } @catch (NSException *e) {}
+    @try { [mc setValue:@YES forKey:@"shouldSuppressDefaultAction"]; } @catch (NSException *e) {}
 
-    // Tự động gom cụm theo Mode đã chọn trong cài đặt
-    newContent.threadIdentifier = zk_determineThreadIdentifier(origContent);
+    NSInteger mode = [[NSUserDefaults standardUserDefaults] integerForKey:kPrefGroupModeKey];
 
-    // QUAN TRỌNG:
-    // sound = nil để SpringBoard hoàn toàn im lặng, không rung chuông
-    newContent.sound = nil;
-
-    NSMutableDictionary *dict = [NSMutableDictionary dictionary];
-    if (origContent.userInfo) {
-        [dict addEntriesFromDictionary:origContent.userInfo];
+    if (mode == 1) {
+        // Mode 1: Không gom gì hết, thể hiện theo thứ tự thời gian (mỗi tin 1 stack độc lập)
+        mc.threadIdentifier = [[NSUUID UUID] UUIDString];
+    } else {
+        // Mode 0 (Mặc định): Gom theo nhóm (cá nhân, nhóm chat), giữ nguyên vị trí
+        // Bảo tồn nguyên vẹn threadIdentifier gốc của Zalo để không bị văng ra khỏi stack
+        if (origContent.threadIdentifier && origContent.threadIdentifier.length > 0) {
+            mc.threadIdentifier = origContent.threadIdentifier;
+        } else {
+            // Dự phòng nếu notification gốc chưa có threadIdentifier
+            NSDictionary *userInfo = origContent.userInfo;
+            if (userInfo[@"grid"] && [userInfo[@"grid"] description].length > 0) {
+                mc.threadIdentifier = [NSString stringWithFormat:@"group_%@", userInfo[@"grid"]];
+            } else if (userInfo[@"from_uid"] && [userInfo[@"from_uid"] description].length > 0) {
+                mc.threadIdentifier = [NSString stringWithFormat:@"user_%@", userInfo[@"from_uid"]];
+            } else if (origContent.title.length > 0) {
+                mc.threadIdentifier = [NSString stringWithFormat:@"chat_%lu", (unsigned long)[origContent.title hash]];
+            }
+        }
     }
-    // Cờ đánh dấu thông báo này được dylib phục hồi, chặn willPresentNotification tạo popup
-    dict[@"zk_kept"] = @YES;
-    dict[@"zk_restored_at"] = [NSNumber numberWithDouble:[[NSDate date] timeIntervalSince1970]];
-    newContent.userInfo = dict;
 
-    return newContent;
+    mc.categoryIdentifier = origContent.categoryIdentifier;
+
+    // Đánh dấu cờ nội bộ để willPresentNotification nhận diện và dập tắt hoàn toàn popup
+    NSMutableDictionary *u = [mc.userInfo mutableCopy] ?: [NSMutableDictionary dictionary];
+    u[@"zk_kept"] = @YES;
+    mc.userInfo = u;
+
+    return mc;
 }
 
 // ==========================================
@@ -416,8 +363,12 @@ static void swiz_willPresent(id self, SEL _cmd, UNUserNotificationCenter *center
     // Chặn triệt để popup banner khi thông báo được dylib ghim lại
     if (userInfo && userInfo[@"zk_kept"]) {
         NSLog(@"[ZaloKeepNotif] Suppressed in-app popup banner for restored notification id=%@", notification.request.identifier);
+        UNNotificationPresentationOptions keptOpts = 0;
+        if (@available(iOS 14.0, *)) {
+            keptOpts = (1 << 3); // UNNotificationPresentationOptionList ONLY
+        }
         if (completionHandler) {
-            completionHandler((1 << 3)); // Chỉ hiển thị trong danh sách thông báo, 0 banner, 0 sound
+            completionHandler(keptOpts);
         }
         return;
     }
@@ -560,7 +511,7 @@ static void swiz_setDelegate(id self, SEL _cmd, id<UNUserNotificationCenterDeleg
 // ==========================================
 __attribute__((constructor)) static void initZaloKeepNotif() {
     @autoreleasepool {
-        NSLog(@"[ZaloKeepNotif] Initializing v11 tweak (Fixed Overlay Button on Zalo Lockscreen + Cascading Monotonic Engine)...");
+        NSLog(@"[ZaloKeepNotif] Initializing v12 tweak (Fixed Overlay Button + 2-Option Grouping + Pure Preserved Thread)...");
 
         // Hook UIViewController viewDidAppear để gắn nút cố định ngay trên màn hình khóa Zalo
         Class vcClass = objc_getClass("UIViewController");
