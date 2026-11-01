@@ -230,6 +230,19 @@ static void EnsureSettingsWindow(void) {
 // ==========================================
 // 1. CHẶN XÓA THÔNG BÁO TỪ UNUserNotificationCenter
 // ==========================================
+static void (*orig_removeDeliveredWithIds)(id, SEL, NSArray<NSString *> *) = NULL;
+static BOOL sAllowInternalRemove = NO;
+
+static void swiz_removeDeliveredWithIds(id self, SEL _cmd, NSArray<NSString *> *identifiers) {
+    if (sAllowInternalRemove) {
+        if (orig_removeDeliveredWithIds) {
+            orig_removeDeliveredWithIds(self, _cmd, identifiers);
+        }
+        return;
+    }
+    NSLog(@"[ZaloKeepNotif] Blocked external removeDeliveredNotificationsWithIdentifiers: count=%lu", (unsigned long)identifiers.count);
+}
+
 @interface UNUserNotificationCenter (ZaloKeepNotif)
 @end
 
@@ -237,10 +250,6 @@ static void EnsureSettingsWindow(void) {
 
 - (void)zk_removeAllDeliveredNotifications {
     NSLog(@"[ZaloKeepNotif] Blocked removeAllDeliveredNotifications");
-}
-
-- (void)zk_removeDeliveredNotificationsWithIdentifiers:(NSArray<NSString *> *)identifiers {
-    NSLog(@"[ZaloKeepNotif] Blocked removeDeliveredNotificationsWithIdentifiers: count=%lu", (unsigned long)identifiers.count);
 }
 
 - (void)zk_removeAllPendingNotificationRequests {
@@ -326,7 +335,7 @@ static UNMutableNotificationContent *zk_prepareContentCopy(UNNotificationContent
 }
 
 // ==========================================
-// 4. CASCADE MONOTONIC RE-ORDERING ENGINE (20ms tuần tự)
+// 4. CASCADE MONOTONIC RE-ORDERING ENGINE (30ms tuần tự)
 // ==========================================
 static void zk_sequentialRepost(NSArray<UNNotificationRequest *> *queue, NSUInteger index, void (^onComplete)(void)) {
     if (index >= queue.count) {
@@ -342,8 +351,8 @@ static void zk_sequentialRepost(NSArray<UNNotificationRequest *> *queue, NSUInte
             NSLog(@"[ZaloKeepNotif] Successfully reposted request [%lu/%lu] id=%@", (unsigned long)index, (unsigned long)queue.count, req.identifier);
         }
 
-        // Delay 20ms giữa mỗi thông báo để usernoted gán monotonic timestamp tăng dần
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.02 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        // Delay 30ms giữa mỗi thông báo để usernoted ghi nhận SQLite timestamp tăng dần rõ rệt
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.030 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             zk_sequentialRepost(queue, index + 1, onComplete);
         });
     }];
@@ -406,11 +415,15 @@ static void swiz_didReceive(id self, SEL _cmd, UNUserNotificationCenter *center,
     // 3. Lấy danh sách toàn bộ thông báo đang có trên Lockscreen để tính toán thứ tự tương đối
     [[UNUserNotificationCenter currentNotificationCenter] getDeliveredNotificationsWithCompletionHandler:^(NSArray<UNNotification *> * _Nonnull deliveredList) {
         NSMutableArray<UNNotification *> *newerNotifications = [NSMutableArray array];
+        NSMutableArray<NSString *> *newerIdentifiers = [NSMutableArray array];
 
         for (UNNotification *n in deliveredList) {
             // Lọc ra các thông báo vốn dĩ đến SAU thông báo vừa click
             if ([n.date compare:tappedDate] == NSOrderedDescending) {
                 [newerNotifications addObject:n];
+                if (n.request.identifier) {
+                    [newerIdentifiers addObject:n.request.identifier];
+                }
             }
         }
 
@@ -440,10 +453,18 @@ static void swiz_didReceive(id self, SEL _cmd, UNUserNotificationCenter *center,
             [repostQueue addObject:req];
         }
 
-        NSLog(@"[ZaloKeepNotif] Executing Cascading Monotonic Re-order. Total items: %lu", (unsigned long)repostQueue.count);
+        NSLog(@"[ZaloKeepNotif] Executing Cascading Monotonic Re-order. Total items: %lu, newer to purge: %lu", (unsigned long)repostQueue.count, (unsigned long)newerIdentifiers.count);
 
-        // Chạy quy trình nạp tuần tự trên main queue sau 0.25s khi SpringBoard đã ổn định view
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        // QUAN TRỌNG NHẤT:
+        // Xóa các thông báo mới hơn khỏi usernoted trước, sau đó nạp lại tuần tự để usernoted gán timestamp mới tuyệt đối
+        if (newerIdentifiers.count > 0 && orig_removeDeliveredWithIds) {
+            sAllowInternalRemove = YES;
+            orig_removeDeliveredWithIds([UNUserNotificationCenter currentNotificationCenter], @selector(removeDeliveredNotificationsWithIdentifiers:), newerIdentifiers);
+            sAllowInternalRemove = NO;
+        }
+
+        // Chạy quy trình nạp tuần tự trên main queue sau 0.08s
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.08 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             zk_sequentialRepost(repostQueue, 0, ^{
                 NSLog(@"[ZaloKeepNotif] Cascading Monotonic Re-order finished. Lockscreen order preserved perfectly!");
             });
@@ -511,7 +532,7 @@ static void swiz_setDelegate(id self, SEL _cmd, id<UNUserNotificationCenterDeleg
 // ==========================================
 __attribute__((constructor)) static void initZaloKeepNotif() {
     @autoreleasepool {
-        NSLog(@"[ZaloKeepNotif] Initializing v12 tweak (Fixed Overlay Button + 2-Option Grouping + Pure Preserved Thread)...");
+        NSLog(@"[ZaloKeepNotif] Initializing v13 tweak (Purge-and-Cascade Engine + Fixed Overlay Button)...");
 
         // Hook UIViewController viewDidAppear để gắn nút cố định ngay trên màn hình khóa Zalo
         Class vcClass = objc_getClass("UIViewController");
@@ -546,9 +567,13 @@ __attribute__((constructor)) static void initZaloKeepNotif() {
             SwizzleMethod(uncClass,
                           @selector(removeAllDeliveredNotifications),
                           @selector(zk_removeAllDeliveredNotifications));
-            SwizzleMethod(uncClass,
-                          @selector(removeDeliveredNotificationsWithIdentifiers:),
-                          @selector(zk_removeDeliveredNotificationsWithIdentifiers:));
+
+            Method remMethod = class_getInstanceMethod(uncClass, @selector(removeDeliveredNotificationsWithIdentifiers:));
+            if (remMethod) {
+                orig_removeDeliveredWithIds = (void (*)(id, SEL, NSArray<NSString *> *))method_getImplementation(remMethod);
+                method_setImplementation(remMethod, (IMP)swiz_removeDeliveredWithIds);
+            }
+
             SwizzleMethod(uncClass,
                           @selector(removeAllPendingNotificationRequests),
                           @selector(zk_removeAllPendingNotificationRequests));
