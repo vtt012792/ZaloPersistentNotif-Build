@@ -1,53 +1,38 @@
-name: Build ZaloPersistentNotif (Linux)
+name: Build ZaloPersistentNotif Tweak
 
 on:
   workflow_dispatch:
-  push:
+
+concurrency:
+  group: theos-build
+  cancel-in-progress: false
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: macos-14
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: Setup Theos
         run: |
-          sudo apt-get update
-          sudo apt-get install -y clang lld llvm
+          brew install ldid
+          git clone --recursive https://github.com/theos/theos.git ~/theos
+          curl -sLo /tmp/sdks.zip https://github.com/theos/sdks/archive/master.zip
+          unzip -q /tmp/sdks.zip -d /tmp/sdks
+          mv /tmp/sdks/sdks-master/*.sdk ~/theos/sdks/ || true
 
-      - name: Install ldid
+      - name: Compile Tweak
         run: |
-          curl -sL https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_linux_x86_64 -o ldid || true
-          if [ -f ldid ]; then
-            chmod +x ldid
-            sudo mv ldid /usr/local/bin/
-          fi
-
-      - name: Download iOS SDK
-        run: |
-          git clone --depth=1 https://github.com/theos/sdks /tmp/sdks
-          SDK=$(find /tmp/sdks -name "iPhoneOS*.sdk" -type d | sort -V | tail -n 1)
-          echo "Found SDK: $SDK"
-          echo "SDK_PATH=$SDK" >> $GITHUB_ENV
-
-      - name: Compile Dylib
-        run: |
-          clang -target arm64-apple-ios14.0 \
-            -fuse-ld=lld \
-            -isysroot $SDK_PATH \
-            -shared -fobjc-arc -O2 \
-            -framework Foundation -framework UIKit -framework UserNotifications \
-            ZaloPersistentNotif.m -o ZaloPersistentNotif.dylib
-
-          if command -v ldid >/dev/null 2>&1; then
-            ldid -S ZaloPersistentNotif.dylib || true
-          fi
-          ls -lh ZaloPersistentNotif.dylib
+          export THEOS=~/theos
+          make package FINALPACKAGE=1
 
       - name: Upload Dylib Artifact
         uses: actions/upload-artifact@v4
         with:
           name: ZaloPersistentNotif-Tweak
-          path: ZaloPersistentNotif.dylib
+          path: |
+            .theos/obj/debug/*.dylib
+            .theos/obj/*.dylib
+            packages/*.deb
