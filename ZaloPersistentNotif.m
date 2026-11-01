@@ -85,20 +85,22 @@ static void (*orig_willPresent)(id, SEL, UNUserNotificationCenter *, UNNotificat
 static void (*orig_didReceive)(id, SEL, UNUserNotificationCenter *, UNNotificationResponse *, void (^)(void)) = NULL;
 
 static void swiz_willPresent(id self, SEL _cmd, UNUserNotificationCenter *center, UNNotification *notification, void (^completionHandler)(UNNotificationPresentationOptions)) {
-    // Với tin nhắn re-post (_kept): KHÔNG phát âm thanh, nhưng BẮT BUỘC phải bật Banner + List để hiện lên Lockscreen!
+    // Với tin nhắn re-post (_kept): Tuyệt đối KHÔNG bật popup/banner hay sound, chỉ giữ trong Notification List
     if ([notification.request.identifier containsString:@"_kept"]) {
-        // UNNotificationPresentationOptionList (1<<3) | UNNotificationPresentationOptionBanner (1<<4) | UNNotificationPresentationOptionAlert (1<<2) | UNNotificationPresentationOptionBadge (1<<0)
-        UNNotificationPresentationOptions keptOpts = (1 << 4) | (1 << 3) | (1 << 2) | (1 << 0);
+        // Chỉ dùng UNNotificationPresentationOptionList (1 << 3)
+        // Không có Banner (1 << 4), không có Alert (1 << 2), không có Sound
+        // -> Không hiện popup khó chịu, thông báo giữ nguyên vị trí trong danh sách
+        UNNotificationPresentationOptions keptOpts = (1 << 3);
         if (completionHandler) {
             completionHandler(keptOpts);
         }
         return;
     }
 
-    // Tin nhắn mới đến bình thường: gọi delegate gốc hoặc cho phép hiển thị đầy đủ
+    // Tin nhắn mới đến từ server: hiển thị bình thường
     if (orig_willPresent) {
         orig_willPresent(self, _cmd, center, notification, ^(UNNotificationPresentationOptions options) {
-            options |= ((1 << 4) | (1 << 3) | (1 << 2) | (1 << 0));
+            options |= (1 << 3); // Đảm bảo luôn nằm trong Notification List
             if (completionHandler) {
                 completionHandler(options);
             }
@@ -129,32 +131,33 @@ static void swiz_didReceive(id self, SEL _cmd, UNUserNotificationCenter *center,
     }
 
     // Khi người dùng bấm vào xem thông báo (Default Action): SpringBoard tự xóa noti gốc khỏi Lockscreen.
-    // Ta clone nội dung notification và ghim lại lên Lockscreen ngay lập tức:
+    // Ta clone nội dung notification và ghim lại vào đúng danh sách/nhóm mà không làm nhảy lên đầu:
     if (req && req.content) {
         UNMutableNotificationContent *mc = [req.content mutableCopy];
-        mc.sound = nil; // Tắt âm thanh để không kêu hay rung lại khi đang xem
-        mc.attachments = @[]; // Xóa attachments tạm thời để tránh lỗi UNErrorDomain Code 100 nếu file ảnh temp bị iOS dọn dẹp
+        mc.sound = nil; // Không âm thanh
+        mc.attachments = @[]; // Xóa attachments tạm để tránh lỗi UNErrorDomain Code 100
 
-        // Đặt ID mới duy nhất
-        NSString *baseId = req.identifier;
-        if ([baseId containsString:@"_kept_"]) {
-            NSArray *parts = [baseId componentsSeparatedByString:@"_kept_"];
-            baseId = parts.firstObject;
+        // Giữ nguyên nhóm hội thoại (threadIdentifier) để không phá vỡ thứ tự ngăn nắp
+        mc.threadIdentifier = req.content.threadIdentifier;
+
+        // Dùng identifier có đuôi _kept để willPresentNotification nhận diện và ẩn popup
+        NSString *keptId = req.identifier;
+        if (![keptId containsString:@"_kept"]) {
+            keptId = [NSString stringWithFormat:@"%@_kept", req.identifier];
         }
-        NSString *keptId = [NSString stringWithFormat:@"%@_kept_%llu", baseId, (unsigned long long)[[NSDate date] timeIntervalSince1970]];
 
-        // Không dùng timer trễ (trigger = nil để post ngay lập tức)
+        // Không đặt trigger (post ngay)
         UNNotificationRequest *keptReq = [UNNotificationRequest requestWithIdentifier:keptId
                                                                               content:mc
                                                                               trigger:nil];
 
-        // Trễ 0.6s để SpringBoard hoàn tất việc đóng view noti gốc trước khi nạp noti ghim lại
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        // Trễ 0.5s để SpringBoard đóng noti cũ xong thì restore lại đúng vị trí
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             [[UNUserNotificationCenter currentNotificationCenter] addNotificationRequest:keptReq withCompletionHandler:^(NSError * _Nullable error) {
                 if (!error) {
-                    NSLog(@"[ZaloKeepNotif] Successfully re-pinned notification: %@", keptId);
+                    NSLog(@"[ZaloKeepNotif] Re-pinned silent notification without popup: %@", keptId);
                 } else {
-                    NSLog(@"[ZaloKeepNotif] Failed to re-pin notification: %@", error);
+                    NSLog(@"[ZaloKeepNotif] Failed to re-pin: %@", error);
                 }
             }];
         });
