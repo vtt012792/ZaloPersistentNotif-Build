@@ -78,7 +78,53 @@ static void SwizzleMethod(Class cls, SEL origSel, SEL swizSel) {
 @end
 
 // ==========================================
-// 3. HOOK DELEGATE (TRIỆT TIÊU POPUP & BẢO LƯU THỜI GIAN/THỨ TỰ)
+// 3. CASCADING MONOTONIC RE-ORDERING ENGINE
+// ==========================================
+static UNMutableNotificationContent *zk_prepareContentCopy(UNNotificationContent *origContent) {
+    UNMutableNotificationContent *mc = [origContent mutableCopy];
+    mc.sound = nil; // Tắt âm thanh
+    mc.attachments = @[]; // Xóa attachments tạm tránh lỗi file temp
+
+    // Chống sáng màn hình và chống bung popup
+    @try { [mc setValue:@YES forKey:@"shouldSuppressScreenLightUp"]; } @catch (NSException *e) {}
+    @try { [mc setValue:@YES forKey:@"shouldSuppressDefaultAction"]; } @catch (NSException *e) {}
+
+    // Bảo tồn thread và category để giữ nguyên xấp hội thoại
+    mc.threadIdentifier = origContent.threadIdentifier;
+    mc.categoryIdentifier = origContent.categoryIdentifier;
+
+    // Đánh dấu cờ nội bộ để willPresentNotification nhận diện và dập tắt hoàn toàn popup
+    NSMutableDictionary *u = [mc.userInfo mutableCopy] ?: [NSMutableDictionary dictionary];
+    u[@"zk_kept"] = @YES;
+    mc.userInfo = u;
+
+    return mc;
+}
+
+// Hàm re-post tuần tự đơn điệu để đảm bảo thứ tự thời gian chuẩn xác trong SQLite của usernoted
+static void zk_sequentialRepost(NSArray<UNNotificationRequest *> *requests, NSUInteger index, void (^allDone)(void)) {
+    if (index >= requests.count) {
+        if (allDone) allDone();
+        return;
+    }
+
+    UNNotificationRequest *req = requests[index];
+    [[UNUserNotificationCenter currentNotificationCenter] addNotificationRequest:req withCompletionHandler:^(NSError * _Nullable error) {
+        if (error) {
+            NSLog(@"[ZaloKeepNotif] Sequential re-post failed for id: %@, error: %@", req.identifier, error);
+        } else {
+            NSLog(@"[ZaloKeepNotif] Monotonic update success (%lu/%lu): %@", (unsigned long)(index + 1), (unsigned long)requests.count, req.identifier);
+        }
+
+        // Khoảng trễ 20ms để usernoted tạo mốc thời gian millisecond tăng dần tuyệt đối
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.020 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            zk_sequentialRepost(requests, index + 1, allDone);
+        });
+    }];
+}
+
+// ==========================================
+// 4. HOOK DELEGATE
 // ==========================================
 static void (*orig_setDelegate)(id, SEL, id<UNUserNotificationCenterDelegate>) = NULL;
 static void (*orig_willPresent)(id, SEL, UNUserNotificationCenter *, UNNotification *, void (^)(UNNotificationPresentationOptions)) = NULL;
@@ -115,74 +161,72 @@ static void swiz_willPresent(id self, SEL _cmd, UNUserNotificationCenter *center
 }
 
 static void swiz_didReceive(id self, SEL _cmd, UNUserNotificationCenter *center, UNNotificationResponse *response, void (^completionHandler)(void)) {
-    UNNotificationRequest *req = response.notification.request;
-    NSString *actionId = response.actionIdentifier;
-
+    // 1. Cho Zalo xử lý chuyển vào phòng chat bình thường
     if (orig_didReceive) {
         orig_didReceive(self, _cmd, center, response, completionHandler);
     } else if (completionHandler) {
         completionHandler();
     }
 
-    // Nếu người dùng chủ động vuốt xóa trên Lockscreen: không can thiệp, để hệ thống xóa
+    // 2. Nếu người dùng chủ động vuốt xóa trên Lockscreen: tôn trọng thao tác, không ghim lại
+    NSString *actionId = response.actionIdentifier;
     if ([actionId isEqualToString:UNNotificationDismissActionIdentifier]) {
         NSLog(@"[ZaloKeepNotif] User manually dismissed notification. Not restoring.");
         return;
     }
 
-    // Khi người dùng bấm vào xem thông báo (Default Action):
-    // Phục hồi lại thông báo với ĐÚNG THỜI GIAN GỐC & ĐÚNG NHÓM HỘI THOẠI
-    if (req && req.content) {
-        UNMutableNotificationContent *mc = [req.content mutableCopy];
-        mc.sound = nil; // Tắt âm thanh
-        mc.attachments = @[]; // Xóa attachments tạm tránh lỗi file temp
+    UNNotification *tappedNotif = response.notification;
+    UNNotificationRequest *tappedReq = tappedNotif.request;
+    if (!tappedReq || !tappedReq.content) return;
 
-        // 1. Chống sáng màn hình và chống bung popup
-        @try { [mc setValue:@YES forKey:@"shouldSuppressScreenLightUp"]; } @catch (NSException *e) {}
-        @try { [mc setValue:@YES forKey:@"shouldSuppressDefaultAction"]; } @catch (NSException *e) {}
+    NSDate *tappedDate = tappedNotif.date ?: [NSDate dateWithTimeIntervalSinceNow:-60];
 
-        // 2. Bảo lưu chính xác thời gian nhận ban đầu (origDate) qua KVC để giữ nguyên thứ tự sắp xếp trên Lockscreen
-        NSDate *origDate = response.notification.date;
-        if (origDate) {
-            @try {
-                [mc setValue:origDate forKey:@"date"];
-            } @catch (NSException *e) {}
-        }
+    // 3. Lấy danh sách toàn bộ thông báo đang có trên Lockscreen để tính toán thứ tự tương đối
+    [[UNUserNotificationCenter currentNotificationCenter] getDeliveredNotificationsWithCompletionHandler:^(NSArray<UNNotification *> * _Nonnull deliveredList) {
+        NSMutableArray<UNNotification *> *newerNotifications = [NSMutableArray array];
 
-        // 3. Bảo lưu và thiết lập nhóm hội thoại (threadIdentifier) chuẩn xác
-        NSString *tid = req.content.threadIdentifier;
-        if (!tid || tid.length == 0) {
-            NSDictionary *u = req.content.userInfo;
-            tid = u[@"thread-id"] ?: u[@"thread_id"] ?: u[@"conv_id"] ?: u[@"chat_id"] ?: u[@"uid"] ?: u[@"from"];
-            if (!tid && req.content.title.length > 0) {
-                tid = [NSString stringWithFormat:@"zalo_%lu", (unsigned long)[req.content.title hash]];
+        for (UNNotification *n in deliveredList) {
+            // Lọc ra các thông báo vốn dĩ đến SAU thông báo vừa click
+            if ([n.date compare:tappedDate] == NSOrderedDescending) {
+                [newerNotifications addObject:n];
             }
         }
-        mc.threadIdentifier = tid;
-        mc.categoryIdentifier = req.content.categoryIdentifier;
 
-        // 4. Đánh dấu cờ nội bộ trong userInfo để nhận diện trong willPresentNotification
-        NSMutableDictionary *u = [mc.userInfo mutableCopy] ?: [NSMutableDictionary dictionary];
-        u[@"zk_kept"] = @YES;
-        mc.userInfo = u;
+        // Sắp xếp các thông báo mới hơn theo thứ tự TĂNG DẦN (từ cũ đến mới)
+        [newerNotifications sortUsingComparator:^NSComparisonResult(UNNotification *n1, UNNotification *n2) {
+            return [n1.date compare:n2.date];
+        }];
 
-        // 5. Dùng CHÍNH XÁC ID GỐC của notification (req.identifier) để thay thế đúng vị trí cũ trong danh sách
-        NSString *targetId = req.identifier;
-        UNNotificationRequest *keptReq = [UNNotificationRequest requestWithIdentifier:targetId
-                                                                              content:mc
+        // Xây dựng hàng đợi nạp tuần tự đơn điệu:
+        // [0]: Thông báo vừa click (nhận mốc t0)
+        // [1...m]: Các thông báo mới hơn lần lượt nhận t1 < t2 < ... < tm
+        NSMutableArray<UNNotificationRequest *> *repostQueue = [NSMutableArray array];
+
+        // A. Thêm thông báo vừa bấm vào hàng đợi đầu tiên
+        UNMutableNotificationContent *tappedContent = zk_prepareContentCopy(tappedReq.content);
+        UNNotificationRequest *repostTappedReq = [UNNotificationRequest requestWithIdentifier:tappedReq.identifier
+                                                                                      content:tappedContent
+                                                                                      trigger:nil];
+        [repostQueue addObject:repostTappedReq];
+
+        // B. Thêm các thông báo mới hơn vào sau để đảm bảo chúng luôn nằm TRÊN thông báo vừa bấm
+        for (UNNotification *n in newerNotifications) {
+            UNMutableNotificationContent *newerContent = zk_prepareContentCopy(n.request.content);
+            UNNotificationRequest *req = [UNNotificationRequest requestWithIdentifier:n.request.identifier
+                                                                              content:newerContent
                                                                               trigger:nil];
+            [repostQueue addObject:req];
+        }
 
-        // Khôi phục sau 0.3s khi giao diện mở app đã ổn định
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            [[UNUserNotificationCenter currentNotificationCenter] addNotificationRequest:keptReq withCompletionHandler:^(NSError * _Nullable error) {
-                if (!error) {
-                    NSLog(@"[ZaloKeepNotif] Restored notification preserving original date & position: %@", targetId);
-                } else {
-                    NSLog(@"[ZaloKeepNotif] Restore error: %@", error);
-                }
-            }];
+        NSLog(@"[ZaloKeepNotif] Executing Cascading Monotonic Re-order. Total items: %lu", (unsigned long)repostQueue.count);
+
+        // Chạy quy trình nạp tuần tự trên main queue sau 0.25s khi SpringBoard đã ổn định view
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            zk_sequentialRepost(repostQueue, 0, ^{
+                NSLog(@"[ZaloKeepNotif] Cascading Monotonic Re-order finished. Lockscreen order preserved perfectly!");
+            });
         });
-    }
+    }];
 }
 
 static BOOL swiz_respondsToSelector(id self, SEL _cmd, SEL aSelector) {
@@ -241,11 +285,11 @@ static void swiz_setDelegate(id self, SEL _cmd, id<UNUserNotificationCenterDeleg
 }
 
 // ==========================================
-// 4. CONSTRUCTOR
+// 5. CONSTRUCTOR
 // ==========================================
 __attribute__((constructor)) static void initZaloKeepNotif() {
     @autoreleasepool {
-        NSLog(@"[ZaloKeepNotif] Initializing v7 tweak...");
+        NSLog(@"[ZaloKeepNotif] Initializing v8 tweak (Cascading Monotonic Re-order Engine)...");
 
         Class uncClass = objc_getClass("UNUserNotificationCenter");
         if (uncClass) {
