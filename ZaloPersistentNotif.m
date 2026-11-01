@@ -6,14 +6,26 @@
 static NSString *const kPrefGroupModeKey = @"ZaloNotif_GroupMode";
 
 // Group modes:
-// 0: Tách riêng từng Cá nhân & Nhóm
+// 0: Tách riêng từng Cá nhân & Nhóm (Mặc định)
 // 1: Gom tất cả vào 1 mục Zalo chung
 // 2: Xếp theo dòng thời gian (Không gom)
 
-static void SwizzleInstanceMethod(Class cls, SEL origSel, SEL swizSel) {
+static void SafeSwizzle(Class cls, SEL origSel, SEL swizSel) {
+    if (!cls) return;
     Method origMethod = class_getInstanceMethod(cls, origSel);
     Method swizMethod = class_getInstanceMethod(cls, swizSel);
-    if (origMethod && swizMethod) {
+    if (!origMethod || !swizMethod) return;
+
+    BOOL didAdd = class_addMethod(cls,
+                                  origSel,
+                                  method_getImplementation(swizMethod),
+                                  method_getTypeEncoding(swizMethod));
+    if (didAdd) {
+        class_replaceMethod(cls,
+                            swizSel,
+                            method_getImplementation(origMethod),
+                            method_getTypeEncoding(origMethod));
+    } else {
         method_exchangeImplementations(origMethod, swizMethod);
     }
 }
@@ -89,7 +101,7 @@ static void ShowGroupingSettings() {
 @end
 
 // ==========================================
-// 2. HOOK UNUserNotificationCenter (CHỐNG XOÁ TUYỆT ĐỐI)
+// 2. HOOK UNUserNotificationCenter
 // ==========================================
 @interface UNUserNotificationCenter (ZaloKeepNotif)
 @end
@@ -109,13 +121,12 @@ static void ShowGroupingSettings() {
 }
 
 - (void)zk_removePendingNotificationRequestsWithIdentifiers:(NSArray<NSString *> *)identifiers {
-    NSLog(@"[ZaloKeepNotif] Blocked removePendingNotificationRequestsWithIdentifiers");
+    NSLog(@"[ZaloKeepNotif] Blocked removePendingNotificationRequestsWithIdentifiers count=%lu", (unsigned long)identifiers.count);
 }
 
-// iOS 16+ setBadgeCount:withCompletionHandler:
 - (void)zk_setBadgeCount:(NSInteger)newBadgeCount withCompletionHandler:(void (^)(NSError *error))completionHandler {
     if (newBadgeCount <= 0) {
-        NSLog(@"[ZaloKeepNotif] Suppressed setBadgeCount:%ld to prevent lockscreen wipe", (long)newBadgeCount);
+        NSLog(@"[ZaloKeepNotif] Suppressed setBadgeCount:%ld to prevent Lockscreen wipe", (long)newBadgeCount);
         if (completionHandler) completionHandler(nil);
         return;
     }
@@ -181,48 +192,71 @@ static void ShowGroupingSettings() {
 @end
 
 // ==========================================
-// 4. HOOK DELEGATE (HIỂN THỊ + GIỮ LẠI KHI CLICK ĐỌC)
+// 4. HOOK DELEGATE (GIỮ NGUYÊN NOTI KHI CLICK ĐỌC)
 // ==========================================
 static void (*orig_setDelegate)(id, SEL, id<UNUserNotificationCenterDelegate>);
 static void (*orig_willPresent)(id, SEL, UNUserNotificationCenter *, UNNotification *, void (^)(UNNotificationPresentationOptions));
 static void (*orig_didReceive)(id, SEL, UNUserNotificationCenter *, UNNotificationResponse *, void (^)(void));
 
 static void swiz_willPresent(id self, SEL _cmd, UNUserNotificationCenter *center, UNNotification *notification, void (^completionHandler)(UNNotificationPresentationOptions)) {
-    UNNotificationPresentationOptions options = UNNotificationPresentationOptionBanner | 
-                                               UNNotificationPresentationOptionSound | 
-                                               UNNotificationPresentationOptionBadge | 
-                                               UNNotificationPresentationOptionList;
+    // Mọi thông báo đều được lưu vào Notification List (Lockscreen / Notification Center)
+    UNNotificationPresentationOptions options = UNNotificationPresentationOptionList | UNNotificationPresentationOptionBadge;
+
+    // Nếu không phải là thông báo re-post (_kept) thì cho hiện banner và phát âm thanh
+    if (![notification.request.identifier hasSuffix:@"_kept"]) {
+        options |= (UNNotificationPresentationOptionBanner | UNNotificationPresentationOptionSound);
+    }
+
     if (completionHandler) {
         completionHandler(options);
     }
 }
 
-// Khi người dùng click vào thông báo từ Lockscreen để đọc:
+// Bắt sự kiện khi người dùng CHẠM/CLICK vào thông báo trên Lockscreen để mở vào Zalo đọc:
 static void swiz_didReceive(id self, SEL _cmd, UNUserNotificationCenter *center, UNNotificationResponse *response, void (^completionHandler)(void)) {
-    // Lưu lại request thông báo trước khi hệ thống xóa
     UNNotificationRequest *req = response.notification.request;
 
-    // Gọi hàm xử lý gốc của Zalo để mở đúng cuộc trò chuyện
+    // Cho Zalo mở đúng hội thoại bình thường
     if (orig_didReceive) {
         orig_didReceive(self, _cmd, center, response, completionHandler);
     } else if (completionHandler) {
         completionHandler();
     }
 
-    // Sau khi hệ thống iOS tự động xóa thông báo vừa click, ta lập tức đăng lại (re-post)
-    // để thông báo tiếp tục nằm nguyên trên Lockscreen / Notification Center cho đến khi tự tay vuốt xóa!
-    if (req) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            NSLog(@"[ZaloKeepNotif] Re-posting clicked notification to keep it on Lockscreen: %@", req.identifier);
-            [[UNUserNotificationCenter currentNotificationCenter] addNotificationRequest:req withCompletionHandler:nil];
+    // SpringBoard của iOS tự động xóa thông báo vừa click.
+    // Tweak lập tức clone lại nội dung và re-post bằng Local Trigger để ghim lại trên Lockscreen:
+    if (req && req.content) {
+        UNMutableNotificationContent *newContent = [req.content mutableCopy];
+        newContent.sound = nil; // Không phát lại âm thanh để không làm phiền khi đang đọc trong app
+
+        if (req.content.threadIdentifier) {
+            newContent.threadIdentifier = req.content.threadIdentifier;
+        }
+
+        // Tạo local trigger 0.2s (BẮT BUỘC để không bị iOS reject do UNPushNotificationTrigger)
+        UNTimeIntervalNotificationTrigger *trigger = [UNTimeIntervalNotificationTrigger triggerWithTimeInterval:0.2 repeats:NO];
+
+        NSString *repostId = [NSString stringWithFormat:@"%@_kept", req.identifier];
+        UNNotificationRequest *repostReq = [UNNotificationRequest requestWithIdentifier:repostId
+                                                                                content:newContent
+                                                                                trigger:trigger];
+
+        // Dispatch sau 0.4s để chắc chắn SpringBoard đã hoàn thành animation mở app
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            [[UNUserNotificationCenter currentNotificationCenter] addNotificationRequest:repostReq withCompletionHandler:^(NSError * _Nullable error) {
+                if (error) {
+                    NSLog(@"[ZaloKeepNotif] Repost error: %@", error);
+                } else {
+                    NSLog(@"[ZaloKeepNotif] Successfully pinned notification back to Lockscreen: %@", repostId);
+                }
+            }];
         });
     }
 }
 
 static void hookDelegateClass(Class delClass) {
     if (!delClass) return;
-    
-    // 1. Hook willPresentNotification:
+
     SEL willPresentSel = @selector(userNotificationCenter:willPresentNotification:withCompletionHandler:);
     Method mWillPresent = class_getInstanceMethod(delClass, willPresentSel);
     if (mWillPresent) {
@@ -230,7 +264,6 @@ static void hookDelegateClass(Class delClass) {
         method_setImplementation(mWillPresent, (IMP)swiz_willPresent);
     }
 
-    // 2. Hook didReceiveNotificationResponse:
     SEL didRecvSel = @selector(userNotificationCenter:didReceiveNotificationResponse:withCompletionHandler:);
     Method mDidRecv = class_getInstanceMethod(delClass, didRecvSel);
     if (mDidRecv) {
@@ -273,34 +306,31 @@ static void AddGestureToWindow(UIWindow *window) {
 // ==========================================
 __attribute__((constructor)) static void initZaloKeepNotif() {
     @autoreleasepool {
-        NSLog(@"[ZaloKeepNotif] Initializing complete persistent notification tweak...");
+        NSLog(@"[ZaloKeepNotif] Initializing v2.0 with persistent re-pinning on tap...");
 
         Class uncClass = objc_getClass("UNUserNotificationCenter");
         if (uncClass) {
-            SwizzleInstanceMethod(uncClass,
-                                  @selector(removeAllDeliveredNotifications),
-                                  @selector(zk_removeAllDeliveredNotifications));
-            SwizzleInstanceMethod(uncClass,
-                                  @selector(removeDeliveredNotificationsWithIdentifiers:),
-                                  @selector(zk_removeDeliveredNotificationsWithIdentifiers:));
-            SwizzleInstanceMethod(uncClass,
-                                  @selector(removeAllPendingNotificationRequests),
-                                  @selector(zk_removeAllPendingNotificationRequests));
-            SwizzleInstanceMethod(uncClass,
-                                  @selector(removePendingNotificationRequestsWithIdentifiers:),
-                                  @selector(zk_removePendingNotificationRequestsWithIdentifiers:));
-            SwizzleInstanceMethod(uncClass,
-                                  @selector(addNotificationRequest:withCompletionHandler:),
-                                  @selector(zk_addNotificationRequest:withCompletionHandler:));
+            SafeSwizzle(uncClass,
+                        @selector(removeAllDeliveredNotifications),
+                        @selector(zk_removeAllDeliveredNotifications));
+            SafeSwizzle(uncClass,
+                        @selector(removeDeliveredNotificationsWithIdentifiers:),
+                        @selector(zk_removeDeliveredNotificationsWithIdentifiers:));
+            SafeSwizzle(uncClass,
+                        @selector(removeAllPendingNotificationRequests),
+                        @selector(zk_removeAllPendingNotificationRequests));
+            SafeSwizzle(uncClass,
+                        @selector(removePendingNotificationRequestsWithIdentifiers:),
+                        @selector(zk_removePendingNotificationRequestsWithIdentifiers:));
+            SafeSwizzle(uncClass,
+                        @selector(addNotificationRequest:withCompletionHandler:),
+                        @selector(zk_addNotificationRequest:withCompletionHandler:));
 
-            // Hook setBadgeCount:withCompletionHandler: (iOS 16+)
             SEL setBadgeSel = @selector(setBadgeCount:withCompletionHandler:);
             if (class_getInstanceMethod(uncClass, setBadgeSel)) {
-                SwizzleInstanceMethod(uncClass, setBadgeSel, @selector(zk_setBadgeCount:withCompletionHandler:));
-                NSLog(@"[ZaloKeepNotif] Hooked setBadgeCount:withCompletionHandler:");
+                SafeSwizzle(uncClass, setBadgeSel, @selector(zk_setBadgeCount:withCompletionHandler:));
             }
 
-            // Hook setDelegate:
             Method setDelMethod = class_getInstanceMethod(uncClass, @selector(setDelegate:));
             if (setDelMethod) {
                 orig_setDelegate = (void (*)(id, SEL, id<UNUserNotificationCenterDelegate>))method_getImplementation(setDelMethod);
@@ -313,20 +343,18 @@ __attribute__((constructor)) static void initZaloKeepNotif() {
             }
         }
 
-        // Hook UIApplication badge
         Class appClass = objc_getClass("UIApplication");
         if (appClass) {
-            SwizzleInstanceMethod(appClass,
-                                  @selector(setApplicationIconBadgeNumber:),
-                                  @selector(zk_setApplicationIconBadgeNumber:));
+            SafeSwizzle(appClass,
+                        @selector(setApplicationIconBadgeNumber:),
+                        @selector(zk_setApplicationIconBadgeNumber:));
         }
 
-        // Hook UIWindow shake
         Class winClass = objc_getClass("UIWindow");
         if (winClass) {
-            SwizzleInstanceMethod(winClass,
-                                  @selector(motionEnded:withEvent:),
-                                  @selector(zk_motionEnded:withEvent:));
+            SafeSwizzle(winClass,
+                        @selector(motionEnded:withEvent:),
+                        @selector(zk_motionEnded:withEvent:));
         }
 
         [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidFinishLaunchingNotification
