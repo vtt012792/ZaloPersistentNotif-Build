@@ -136,7 +136,7 @@ static void ShowGroupingSettings(void) {
     newCenter.y = MAX(halfH + 44, MIN(newCenter.y, superview.bounds.size.height - halfH - 34));
 
     self.center = newCenter;
-    [pan setTranslation:CGPointZero inView:superview];
+    [pan setTranslation:CGPointMake(0, 0) inView:superview];
 
     if (pan.state == UIGestureRecognizerStateEnded) {
         CGFloat snapX = (newCenter.x < superview.bounds.size.width / 2.0) ? (halfW + 10) : (superview.bounds.size.width - halfW - 10);
