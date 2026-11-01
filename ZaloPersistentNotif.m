@@ -31,10 +31,10 @@ static NSString *const kPrefGroupModeKey = @"ZaloNotif_GroupMode";
 
 /*
  Các chế độ gom nhóm (Group Modes):
- Mode 0: Tách riêng từng Cá nhân & Nhóm chat (Mỗi người/nhóm 1 xấp riêng) [Mặc định]
- Mode 1: Gom tất cả thông báo Zalo vào chung 1 xấp duy nhất
- Mode 2: Không gom cụm, hiển thị từng tin nhắn riêng lẻ theo thời gian
- Mode 3: Chỉ gom nhóm chat, tin nhắn cá nhân để riêng
+ Mode 0: 👥 Tách riêng từng Cá nhân & Nhóm chat (Mỗi người/nhóm 1 xấp riêng) [Mặc định]
+ Mode 1: 📦 Gom tất cả thông báo Zalo vào chung 1 xấp duy nhất
+ Mode 2: ⏱️ Không gom cụm (Hiển thị từng tin riêng lẻ theo thời gian)
+ Mode 3: 💬 Chỉ gom nhóm chat, tin cá nhân để riêng lẻ
 */
 
 static void ShowGroupingSettings(void) {
@@ -59,7 +59,7 @@ static void ShowGroupingSettings(void) {
 
         NSInteger currentMode = [[NSUserDefaults standardUserDefaults] integerForKey:kPrefGroupModeKey];
 
-        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"⚙️ Tùy chọn Gom Thông báo Zalo"
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"⚙️ Cài đặt Gom Thông Báo Zalo"
                                                                        message:@"Chọn cách sắp xếp và gom cụm thông báo trên Màn hình khóa (Lockscreen):"
                                                                 preferredStyle:UIAlertControllerStyleActionSheet];
 
@@ -98,18 +98,101 @@ static void ShowGroupingSettings(void) {
     });
 }
 
+// NÚT BẤM NỔI (FLOATING BUTTON) TRỰC QUAN ĐỂ MỞ MENU CÀI ĐẶT
+@interface ZKFloatingButton : UIButton
+@end
+
+@implementation ZKFloatingButton
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (self) {
+        self.backgroundColor = [UIColor colorWithRed:0.0 green:0.45 blue:0.95 alpha:0.85]; // Màu xanh Zalo
+        self.layer.cornerRadius = frame.size.width / 2.0;
+        self.layer.masksToBounds = YES;
+        self.layer.borderWidth = 2.0;
+        self.layer.borderColor = [UIColor whiteColor].CGColor;
+        [self setTitle:@"⚙️" forState:UIControlStateNormal];
+        self.titleLabel.font = [UIFont systemFontOfSize:22];
+
+        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePan:)];
+        [self addGestureRecognizer:pan];
+
+        [self addTarget:self action:@selector(btnTapped) forControlEvents:UIControlEventTouchUpInside];
+    }
+    return self;
+}
+
+- (void)handlePan:(UIPanGestureRecognizer *)pan {
+    UIView *superview = self.superview;
+    if (!superview) return;
+
+    CGPoint translation = [pan translationInView:superview];
+    CGPoint newCenter = CGPointMake(self.center.x + translation.x, self.center.y + translation.y);
+
+    CGFloat halfW = self.bounds.size.width / 2.0;
+    CGFloat halfH = self.bounds.size.height / 2.0;
+    newCenter.x = MAX(halfW, MIN(newCenter.x, superview.bounds.size.width - halfW));
+    newCenter.y = MAX(halfH + 44, MIN(newCenter.y, superview.bounds.size.height - halfH - 34));
+
+    self.center = newCenter;
+    [pan setTranslation:CGPointZero inView:superview];
+
+    if (pan.state == UIGestureRecognizerStateEnded) {
+        CGFloat snapX = (newCenter.x < superview.bounds.size.width / 2.0) ? (halfW + 10) : (superview.bounds.size.width - halfW - 10);
+        [UIView animateWithDuration:0.2 animations:^{
+            self.center = CGPointMake(snapX, newCenter.y);
+        }];
+    }
+}
+
+- (void)btnTapped {
+    ShowGroupingSettings();
+}
+
+@end
+
+static ZKFloatingButton *sFloatingBtn = nil;
+static void ensureFloatingButton(UIWindow *window) {
+    if (!window) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (sFloatingBtn && sFloatingBtn.superview == window) return;
+
+        if (!sFloatingBtn) {
+            CGFloat screenW = [UIScreen mainScreen].bounds.size.width;
+            CGFloat screenH = [UIScreen mainScreen].bounds.size.height;
+            sFloatingBtn = [[ZKFloatingButton alloc] initWithFrame:CGRectMake(screenW - 56, screenH - 180, 46, 46)];
+        }
+
+        [window addSubview:sFloatingBtn];
+        [window bringSubviewToFront:sFloatingBtn];
+    });
+}
+
+@interface UIWindow (ZKFloatingHook)
+@end
+
+@implementation UIWindow (ZKFloatingHook)
+
+- (void)zk_makeKeyAndVisible {
+    [self zk_makeKeyAndVisible];
+    ensureFloatingButton(self);
+}
+
+@end
+
 // Hàm tính toán threadIdentifier dựa trên mode đã chọn
 static NSString *zk_determineThreadIdentifier(UNNotificationContent *content) {
     NSInteger mode = [[NSUserDefaults standardUserDefaults] integerForKey:kPrefGroupModeKey];
     NSDictionary *userInfo = content.userInfo;
 
     if (mode == 1) {
-        // Gom tất cả thông báo Zalo vào chung 1 xấp duy nhất
+        // Mode 1: Gom tất cả thông báo Zalo vào chung 1 xấp duy nhất
         return @"com.vng.zalo.all";
     }
 
     if (mode == 2) {
-        // Không gom cụm, mỗi tin nhắn là 1 stack riêng biệt
+        // Mode 2: Không gom cụm, mỗi tin nhắn là 1 stack riêng biệt theo thời gian
         return [[NSUUID UUID] UUIDString];
     }
 
@@ -131,7 +214,7 @@ static NSString *zk_determineThreadIdentifier(UNNotificationContent *content) {
     }
 
     if (mode == 3) {
-        // Chỉ gom nhóm chat, tin cá nhân để riêng
+        // Mode 3: Chỉ gom nhóm chat, tin cá nhân để riêng lẻ
         if (groupId) return groupId;
         return [[NSUUID UUID] UUIDString];
     }
@@ -151,23 +234,8 @@ static NSString *zk_determineThreadIdentifier(UNNotificationContent *content) {
     return @"zalo_general";
 }
 
-// Bắt sự kiện LẮC MÁY (Shake) để bật Menu Tùy chọn Gom Nhóm
-@interface UIWindow (ZaloNotifMenu)
-@end
-
-@implementation UIWindow (ZaloNotifMenu)
-
-- (void)zk_motionEnded:(UIEventSubtype)motion withEvent:(UIEvent *)event {
-    [self zk_motionEnded:motion withEvent:event];
-    if (motion == UIEventSubtypeMotionShake) {
-        ShowGroupingSettings();
-    }
-}
-
-@end
-
 // ==========================================
-// 1. CHẶN XÓA THÔNG BÁO TỪ UNUserNotificationCenter & GOM NHÓM
+// 1. CHẶN XÓA THÔNG BÁO TỪ UNUserNotificationCenter
 // ==========================================
 @interface UNUserNotificationCenter (ZaloKeepNotif)
 @end
@@ -199,17 +267,6 @@ static NSString *zk_determineThreadIdentifier(UNNotificationContent *content) {
     [self zk_setBadgeCount:newBadgeCount withCompletionHandler:completionHandler];
 }
 
-// Hook addNotificationRequest để áp dụng threadIdentifier gom nhóm cho mọi thông báo mới
-- (void)zk_addNotificationRequest:(UNNotificationRequest *)request withCompletionHandler:(void (^)(NSError *error))completionHandler {
-    UNMutableNotificationContent *mc = [request.content mutableCopy];
-    mc.threadIdentifier = zk_determineThreadIdentifier(request.content);
-
-    UNNotificationRequest *newReq = [UNNotificationRequest requestWithIdentifier:request.identifier
-                                                                         content:mc
-                                                                         trigger:request.trigger];
-    [self zk_addNotificationRequest:newReq withCompletionHandler:completionHandler];
-}
-
 @end
 
 // ==========================================
@@ -231,7 +288,7 @@ static NSString *zk_determineThreadIdentifier(UNNotificationContent *content) {
 @end
 
 // ==========================================
-// 3. CASCADING MONOTONIC RE-ORDERING ENGINE
+// 3. CASCADING MONOTONIC RE-ORDERING ENGINE (BẢO TOÀN THỨ TỰ 100%)
 // ==========================================
 static UNMutableNotificationContent *zk_prepareContentCopy(UNNotificationContent *origContent) {
     UNMutableNotificationContent *mc = [origContent mutableCopy];
@@ -442,14 +499,14 @@ static void swiz_setDelegate(id self, SEL _cmd, id<UNUserNotificationCenterDeleg
 // ==========================================
 __attribute__((constructor)) static void initZaloKeepNotif() {
     @autoreleasepool {
-        NSLog(@"[ZaloKeepNotif] Initializing v9 tweak (Grouping Options + Cascading Monotonic Engine)...");
+        NSLog(@"[ZaloKeepNotif] Initializing v10 tweak (Floating Button + Pure Cascading Monotonic Engine)...");
 
-        // Hook UIWindow motionEnded:withEvent: để bật Menu cài đặt khi Lắc máy (Shake)
+        // Hook UIWindow makeKeyAndVisible để gắn Nút Nổi trực quan
         Class winClass = objc_getClass("UIWindow");
         if (winClass) {
             SwizzleMethod(winClass,
-                          @selector(motionEnded:withEvent:),
-                          @selector(zk_motionEnded:withEvent:));
+                          @selector(makeKeyAndVisible),
+                          @selector(zk_makeKeyAndVisible));
         }
 
         Class uncClass = objc_getClass("UNUserNotificationCenter");
@@ -466,11 +523,6 @@ __attribute__((constructor)) static void initZaloKeepNotif() {
             SwizzleMethod(uncClass,
                           @selector(removePendingNotificationRequestsWithIdentifiers:),
                           @selector(zk_removePendingNotificationRequestsWithIdentifiers:));
-
-            // Hook addNotificationRequest để áp dụng gom nhóm cho mọi thông báo
-            SwizzleMethod(uncClass,
-                          @selector(addNotificationRequest:withCompletionHandler:),
-                          @selector(zk_addNotificationRequest:withCompletionHandler:));
 
             SEL setBadgeSel = @selector(setBadgeCount:withCompletionHandler:);
             if (class_getInstanceMethod(uncClass, setBadgeSel)) {
