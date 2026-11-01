@@ -1,34 +1,52 @@
-name: Build ZaloPersistentNotif
+name: Build ZaloPersistentNotif (Linux)
 
 on:
-  push:
   workflow_dispatch:
+  push:
 
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Setup Theos
+      - name: Install dependencies
         run: |
-          brew install ldid
-          git clone --recursive https://github.com/theos/theos.git ~/theos
-          curl -sLo /tmp/sdks.zip https://github.com/theos/sdks/archive/master.zip
-          unzip -q /tmp/sdks.zip -d /tmp/sdks
-          mv /tmp/sdks/sdks-master/*.sdk ~/theos/sdks/ || true
+          sudo apt-get update
+          sudo apt-get install -y clang lld llvm
 
-      - name: Compile Tweak
+      - name: Install ldid
         run: |
-          export THEOS=~/theos
-          make all FINALPACKAGE=1
+          curl -sLo ldid https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_linux_x86_64 || true
+          if [ -f ldid ]; then
+            chmod +x ldid
+            sudo mv ldid /usr/local/bin/
+          fi
+
+      - name: Download iOS SDK
+        run: |
+          curl -LO https://github.com/xybp888/iOS-SDKs/releases/download/iOS-16.5/iPhoneOS16.5.sdk.tar.xz
+          mkdir -p /tmp/sdk
+          tar -xf iPhoneOS16.5.sdk.tar.xz -C /tmp/sdk/
+          echo "SDK_PATH=/tmp/sdk/iPhoneOS16.5.sdk" >> $GITHUB_ENV
+
+      - name: Compile Dylib
+        run: |
+          clang -target arm64-apple-ios14.0 \
+            -isysroot $SDK_PATH \
+            -shared -fobjc-arc -O2 \
+            -framework Foundation -framework UIKit -framework UserNotifications \
+            ZaloPersistentNotif.m -o ZaloPersistentNotif.dylib
+
+          if command -v ldid >/dev/null 2>&1; then
+            ldid -S ZaloPersistentNotif.dylib || true
+          fi
+          ls -lh ZaloPersistentNotif.dylib
 
       - name: Upload Dylib Artifact
         uses: actions/upload-artifact@v4
         with:
           name: ZaloPersistentNotif-Tweak
-          path: |
-            .theos/obj/debug/*.dylib
-            .theos/obj/*.dylib
+          path: ZaloPersistentNotif.dylib
