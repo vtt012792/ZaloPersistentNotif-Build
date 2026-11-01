@@ -1,4 +1,4 @@
-name: Build ZaloPersistentNotif (Fat Binary)
+name: Build ZaloPersistentNotif
 
 on:
   workflow_dispatch:
@@ -32,28 +32,15 @@ jobs:
           echo "Found SDK: $SDK"
           echo "SDK_PATH=$SDK" >> $GITHUB_ENV
 
-      - name: Compile Fat Mach-O (arm64 + arm64e)
+      - name: Compile Dylib
         run: |
-          # 1. Compile arm64 slice
           clang -target arm64-apple-ios14.0 \
             -fuse-ld=lld \
             -isysroot $SDK_PATH \
             -shared -fobjc-arc -O2 \
             -framework Foundation -framework UIKit -framework UserNotifications \
-            ZaloPersistentNotif.m -o ZaloPersistentNotif_arm64.dylib
+            ZaloPersistentNotif.m -o ZaloPersistentNotif.dylib
 
-          # 2. Compile arm64e slice
-          clang -target arm64e-apple-ios14.0 \
-            -fuse-ld=lld \
-            -isysroot $SDK_PATH \
-            -shared -fobjc-arc -O2 \
-            -framework Foundation -framework UIKit -framework UserNotifications \
-            ZaloPersistentNotif.m -o ZaloPersistentNotif_arm64e.dylib
-
-          # 3. Merge into Fat Binary
-          llvm-lipo -create ZaloPersistentNotif_arm64.dylib ZaloPersistentNotif_arm64e.dylib -output ZaloPersistentNotif.dylib
-
-          # 4. Pseudo-sign with ldid
           if command -v ldid >/dev/null 2>&1; then
             ldid -S ZaloPersistentNotif.dylib || true
           fi
