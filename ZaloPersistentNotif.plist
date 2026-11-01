@@ -1,1 +1,2 @@
 { Filter = { Bundles = ( "com.vng.zalo", "com.vng.zing.zalo" ); }; }
+
