@@ -78,73 +78,28 @@ static void SwizzleMethod(Class cls, SEL origSel, SEL swizSel) {
 @end
 
 // ==========================================
-// 3. QUẢN LÝ GHIM THÔNG BÁO KHI VÀO BACKGROUND (KHÔNG POPUP, GIỮ NGUYÊN THỨ TỰ)
-// ==========================================
-static NSMutableDictionary<NSString *, NSDictionary *> *sPendingRePost = nil;
-
-static void repostPendingNotifications() {
-    if (!sPendingRePost || sPendingRePost.count == 0) return;
-
-    NSDictionary *toPost = nil;
-    @synchronized (sPendingRePost) {
-        toPost = [sPendingRePost copy];
-        [sPendingRePost removeAllObjects];
-    }
-
-    UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
-    for (NSString *key in toPost) {
-        NSDictionary *item = toPost[key];
-        UNNotificationRequest *req = item[@"request"];
-        NSDate *origDate = item[@"date"];
-        if (!req || !req.content) continue;
-
-        UNMutableNotificationContent *mc = [req.content mutableCopy];
-        mc.sound = nil; // Không âm thanh
-        mc.attachments = @[]; // Tránh lỗi file temp bị xóa
-
-        // Khôi phục ngày gốc qua KVC để iOS giữ nguyên thứ tự thời gian trên Lockscreen
-        if (origDate) {
-            @try {
-                [mc setValue:origDate forKey:@"date"];
-            } @catch (NSException *e) {}
-        }
-        mc.threadIdentifier = req.content.threadIdentifier;
-
-        NSString *keptId = req.identifier;
-        if (![keptId containsString:@"_kept"]) {
-            keptId = [NSString stringWithFormat:@"%@_kept", req.identifier];
-        }
-
-        UNNotificationRequest *keptReq = [UNNotificationRequest requestWithIdentifier:keptId
-                                                                              content:mc
-                                                                              trigger:nil];
-
-        [center addNotificationRequest:keptReq withCompletionHandler:^(NSError * _Nullable error) {
-            if (!error) {
-                NSLog(@"[ZaloKeepNotif] Successfully restored notification to Lockscreen in original order: %@", keptId);
-            } else {
-                NSLog(@"[ZaloKeepNotif] Failed to restore notification: %@", error);
-            }
-        }];
-    }
-}
-
-// ==========================================
-// 4. HOOK DELEGATE
+// 3. HOOK DELEGATE (TRIỆT TIÊU POPUP & GOM NHÓM STACK)
 // ==========================================
 static void (*orig_setDelegate)(id, SEL, id<UNUserNotificationCenterDelegate>) = NULL;
 static void (*orig_willPresent)(id, SEL, UNUserNotificationCenter *, UNNotification *, void (^)(UNNotificationPresentationOptions)) = NULL;
 static void (*orig_didReceive)(id, SEL, UNUserNotificationCenter *, UNNotificationResponse *, void (^)(void)) = NULL;
+static BOOL (*orig_respondsToSelector)(id, SEL, SEL) = NULL;
 
 static void swiz_willPresent(id self, SEL _cmd, UNUserNotificationCenter *center, UNNotification *notification, void (^completionHandler)(UNNotificationPresentationOptions)) {
-    // Nếu có thông báo re-post: TUYỆT ĐỐI KHÔNG BẬT BANNER/POPUP
+    // Với tin nhắn re-post (_kept): TUYỆT ĐỐI KHÔNG BẬT POPUP/BANNER/SOUND
     if ([notification.request.identifier containsString:@"_kept"]) {
+        UNNotificationPresentationOptions keptOpts = 0;
+        if (@available(iOS 14.0, *)) {
+            // Chỉ gửi vào danh sách Notification Center, không popup banner, không sound
+            keptOpts = (1 << 3); // UNNotificationPresentationOptionList
+        }
         if (completionHandler) {
-            completionHandler((1 << 3)); // Chỉ list, không banner, không alert, không popup
+            completionHandler(keptOpts);
         }
         return;
     }
 
+    // Tin nhắn mới đến bình thường: cho phép hiển thị
     if (orig_willPresent) {
         orig_willPresent(self, _cmd, center, notification, ^(UNNotificationPresentationOptions options) {
             options |= (1 << 3);
@@ -172,39 +127,69 @@ static void swiz_didReceive(id self, SEL _cmd, UNUserNotificationCenter *center,
 
     // Nếu người dùng chủ động vuốt xóa trên Lockscreen: không ghim lại
     if ([actionId isEqualToString:UNNotificationDismissActionIdentifier]) {
-        if (req && sPendingRePost) {
-            @synchronized (sPendingRePost) {
-                [sPendingRePost removeObjectForKey:req.identifier];
-            }
-        }
+        NSLog(@"[ZaloKeepNotif] User manually dismissed notification. Not restoring.");
         return;
     }
 
-    // Khi người dùng bấm vào xem thông báo: lưu lại thông tin thông báo kèm thời gian gốc (date)
-    // KHÔNG đăng thông báo ngay lúc này (tránh hiện popup banner khi đang đọc tin nhắn)
+    // Khi người dùng bấm vào xem thông báo (Default Action):
+    // Tái tạo lại thông báo thầm lặng vào đúng nhóm stack của cuộc hội thoại
     if (req && req.content) {
-        NSDate *origDate = response.notification.date;
-        if (!origDate) origDate = [NSDate date];
+        UNMutableNotificationContent *mc = [req.content mutableCopy];
+        mc.sound = nil; // Tắt hoàn toàn âm thanh
+        mc.attachments = @[]; // Xóa attachments tạm để tránh lỗi hệ thống xóa file temp
 
-        NSMutableDictionary *item = [NSMutableDictionary dictionary];
-        item[@"request"] = req;
-        item[@"date"] = origDate;
+        // Chặn màn hình khóa sáng đèn hoặc bung banner khi thông báo được nạp lại
+        @try {
+            [mc setValue:@YES forKey:@"shouldSuppressScreenLightUp"];
+        } @catch (NSException *e) {}
+        @try {
+            [mc setValue:@YES forKey:@"shouldSuppressDefaultAction"];
+        } @catch (NSException *e) {}
 
-        if (!sPendingRePost) {
-            sPendingRePost = [[NSMutableDictionary alloc] init];
-        }
-        @synchronized (sPendingRePost) {
-            sPendingRePost[req.identifier] = item;
-        }
-        NSLog(@"[ZaloKeepNotif] Queued notification for Lockscreen restoration on background: %@", req.identifier);
+        // Bảo tồn nguyên vẹn nhóm hội thoại (threadIdentifier) và category để iOS gộp vào trong Stack cũ
+        mc.threadIdentifier = req.content.threadIdentifier;
+        mc.categoryIdentifier = req.content.categoryIdentifier;
+
+        // Dùng identifier ổn định, không cộng dồn timestamp
+        NSString *baseId = [req.identifier stringByReplacingOccurrencesOfString:@"_kept" withString:@""];
+        NSString *keptId = [NSString stringWithFormat:@"%@_kept", baseId];
+
+        UNNotificationRequest *keptReq = [UNNotificationRequest requestWithIdentifier:keptId
+                                                                              content:mc
+                                                                              trigger:nil];
+
+        // Nạp lại sau 0.3s khi SpringBoard hoàn tất chuyển cảnh
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            [[UNUserNotificationCenter currentNotificationCenter] addNotificationRequest:keptReq withCompletionHandler:^(NSError * _Nullable error) {
+                if (!error) {
+                    NSLog(@"[ZaloKeepNotif] Successfully re-pinned quiet notification in stack: %@", keptId);
+                } else {
+                    NSLog(@"[ZaloKeepNotif] Re-pin failed: %@", error);
+                }
+            }];
+        });
     }
 }
 
+static BOOL swiz_respondsToSelector(id self, SEL _cmd, SEL aSelector) {
+    if (aSelector == @selector(userNotificationCenter:willPresentNotification:withCompletionHandler:) ||
+        aSelector == @selector(userNotificationCenter:didReceiveNotificationResponse:withCompletionHandler:)) {
+        return YES;
+    }
+    if (orig_respondsToSelector) {
+        return orig_respondsToSelector(self, _cmd, aSelector);
+    }
+    return class_respondsToSelector([self class], aSelector);
+}
+
+static NSMutableSet *sHookedClasses = nil;
 static void hookDelegate(Class delClass) {
     if (!delClass) return;
-    static Class sHookedClass = Nil;
-    if (sHookedClass == delClass) return;
-    sHookedClass = delClass;
+    if (!sHookedClasses) {
+        sHookedClasses = [[NSMutableSet alloc] init];
+    }
+    if ([sHookedClasses containsObject:delClass]) return;
+    [sHookedClasses addObject:delClass];
 
     SEL wpSel = @selector(userNotificationCenter:willPresentNotification:withCompletionHandler:);
     Method mWP = class_getInstanceMethod(delClass, wpSel);
@@ -223,39 +208,31 @@ static void hookDelegate(Class delClass) {
     } else {
         class_addMethod(delClass, drSel, (IMP)swiz_didReceive, "v@:@@@?");
     }
+
+    SEL respSel = @selector(respondsToSelector:);
+    Method mResp = class_getInstanceMethod(delClass, respSel);
+    if (mResp) {
+        orig_respondsToSelector = (BOOL (*)(id, SEL, SEL))method_getImplementation(mResp);
+        method_setImplementation(mResp, (IMP)swiz_respondsToSelector);
+    }
 }
 
 static void swiz_setDelegate(id self, SEL _cmd, id<UNUserNotificationCenterDelegate> delegate) {
-    // Hook TRƯỚC KHI gọi orig_setDelegate để Apple ghi nhận các phương thức delegate đã được cài đặt
+    // Luôn hook delegate TRƯỚC KHI Apple ghi nhận con trỏ delegate
     if (delegate) {
         hookDelegate([delegate class]);
     }
-    orig_setDelegate(self, _cmd, delegate);
+    if (orig_setDelegate) {
+        orig_setDelegate(self, _cmd, delegate);
+    }
 }
 
 // ==========================================
-// 5. CONSTRUCTOR
+// 4. CONSTRUCTOR
 // ==========================================
 __attribute__((constructor)) static void initZaloKeepNotif() {
     @autoreleasepool {
-        NSLog(@"[ZaloKeepNotif] Initializing v5 tweak...");
-
-        sPendingRePost = [[NSMutableDictionary alloc] init];
-
-        // Lắng nghe khi app chuẩn bị vào Background (khóa màn hình hoặc thoát app)
-        [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidEnterBackgroundNotification
-                                                          object:nil
-                                                           queue:[NSOperationQueue mainQueue]
-                                                      usingBlock:^(NSNotification * _Nonnull note) {
-            repostPendingNotifications();
-        }];
-
-        [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationWillTerminateNotification
-                                                          object:nil
-                                                           queue:[NSOperationQueue mainQueue]
-                                                      usingBlock:^(NSNotification * _Nonnull note) {
-            repostPendingNotifications();
-        }];
+        NSLog(@"[ZaloKeepNotif] Initializing v6 tweak...");
 
         Class uncClass = objc_getClass("UNUserNotificationCenter");
         if (uncClass) {
