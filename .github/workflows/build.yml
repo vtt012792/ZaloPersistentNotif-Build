@@ -24,7 +24,7 @@ jobs:
       - name: Compile Tweak
         run: |
           export THEOS=~/theos
-          make package FINALPACKAGE=1
+          make all FINALPACKAGE=1
 
       - name: Upload Dylib Artifact
         uses: actions/upload-artifact@v4
@@ -33,4 +33,3 @@ jobs:
           path: |
             .theos/obj/debug/*.dylib
             .theos/obj/*.dylib
-            packages/*.deb
