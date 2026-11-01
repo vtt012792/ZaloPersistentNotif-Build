@@ -78,7 +78,7 @@ static void SwizzleMethod(Class cls, SEL origSel, SEL swizSel) {
 @end
 
 // ==========================================
-// 3. HOOK DELEGATE (TRIỆT TIÊU POPUP & GOM NHÓM STACK)
+// 3. HOOK DELEGATE (TRIỆT TIÊU POPUP & BẢO LƯU THỜI GIAN/THỨ TỰ)
 // ==========================================
 static void (*orig_setDelegate)(id, SEL, id<UNUserNotificationCenterDelegate>) = NULL;
 static void (*orig_willPresent)(id, SEL, UNUserNotificationCenter *, UNNotification *, void (^)(UNNotificationPresentationOptions)) = NULL;
@@ -86,12 +86,12 @@ static void (*orig_didReceive)(id, SEL, UNUserNotificationCenter *, UNNotificati
 static BOOL (*orig_respondsToSelector)(id, SEL, SEL) = NULL;
 
 static void swiz_willPresent(id self, SEL _cmd, UNUserNotificationCenter *center, UNNotification *notification, void (^completionHandler)(UNNotificationPresentationOptions)) {
-    // Với tin nhắn re-post (_kept): TUYỆT ĐỐI KHÔNG BẬT POPUP/BANNER/SOUND
-    if ([notification.request.identifier containsString:@"_kept"]) {
+    // Với tin nhắn re-post: TUYỆT ĐỐI KHÔNG BẬT POPUP/BANNER/SOUND
+    NSDictionary *userInfo = notification.request.content.userInfo;
+    if (userInfo && userInfo[@"zk_kept"]) {
         UNNotificationPresentationOptions keptOpts = 0;
         if (@available(iOS 14.0, *)) {
-            // Chỉ gửi vào danh sách Notification Center, không popup banner, không sound
-            keptOpts = (1 << 3); // UNNotificationPresentationOptionList
+            keptOpts = (1 << 3); // UNNotificationPresentationOptionList ONLY
         }
         if (completionHandler) {
             completionHandler(keptOpts);
@@ -99,7 +99,6 @@ static void swiz_willPresent(id self, SEL _cmd, UNUserNotificationCenter *center
         return;
     }
 
-    // Tin nhắn mới đến bình thường: cho phép hiển thị
     if (orig_willPresent) {
         orig_willPresent(self, _cmd, center, notification, ^(UNNotificationPresentationOptions options) {
             options |= (1 << 3);
@@ -125,46 +124,61 @@ static void swiz_didReceive(id self, SEL _cmd, UNUserNotificationCenter *center,
         completionHandler();
     }
 
-    // Nếu người dùng chủ động vuốt xóa trên Lockscreen: không ghim lại
+    // Nếu người dùng chủ động vuốt xóa trên Lockscreen: không can thiệp, để hệ thống xóa
     if ([actionId isEqualToString:UNNotificationDismissActionIdentifier]) {
         NSLog(@"[ZaloKeepNotif] User manually dismissed notification. Not restoring.");
         return;
     }
 
     // Khi người dùng bấm vào xem thông báo (Default Action):
-    // Tái tạo lại thông báo thầm lặng vào đúng nhóm stack của cuộc hội thoại
+    // Phục hồi lại thông báo với ĐÚNG THỜI GIAN GỐC & ĐÚNG NHÓM HỘI THOẠI
     if (req && req.content) {
         UNMutableNotificationContent *mc = [req.content mutableCopy];
-        mc.sound = nil; // Tắt hoàn toàn âm thanh
-        mc.attachments = @[]; // Xóa attachments tạm để tránh lỗi hệ thống xóa file temp
+        mc.sound = nil; // Tắt âm thanh
+        mc.attachments = @[]; // Xóa attachments tạm tránh lỗi file temp
 
-        // Chặn màn hình khóa sáng đèn hoặc bung banner khi thông báo được nạp lại
-        @try {
-            [mc setValue:@YES forKey:@"shouldSuppressScreenLightUp"];
-        } @catch (NSException *e) {}
-        @try {
-            [mc setValue:@YES forKey:@"shouldSuppressDefaultAction"];
-        } @catch (NSException *e) {}
+        // 1. Chống sáng màn hình và chống bung popup
+        @try { [mc setValue:@YES forKey:@"shouldSuppressScreenLightUp"]; } @catch (NSException *e) {}
+        @try { [mc setValue:@YES forKey:@"shouldSuppressDefaultAction"]; } @catch (NSException *e) {}
 
-        // Bảo tồn nguyên vẹn nhóm hội thoại (threadIdentifier) và category để iOS gộp vào trong Stack cũ
-        mc.threadIdentifier = req.content.threadIdentifier;
+        // 2. Bảo lưu chính xác thời gian nhận ban đầu (origDate) qua KVC để giữ nguyên thứ tự sắp xếp trên Lockscreen
+        NSDate *origDate = response.notification.date;
+        if (origDate) {
+            @try {
+                [mc setValue:origDate forKey:@"date"];
+            } @catch (NSException *e) {}
+        }
+
+        // 3. Bảo lưu và thiết lập nhóm hội thoại (threadIdentifier) chuẩn xác
+        NSString *tid = req.content.threadIdentifier;
+        if (!tid || tid.length == 0) {
+            NSDictionary *u = req.content.userInfo;
+            tid = u[@"thread-id"] ?: u[@"thread_id"] ?: u[@"conv_id"] ?: u[@"chat_id"] ?: u[@"uid"] ?: u[@"from"];
+            if (!tid && req.content.title.length > 0) {
+                tid = [NSString stringWithFormat:@"zalo_%lu", (unsigned long)[req.content.title hash]];
+            }
+        }
+        mc.threadIdentifier = tid;
         mc.categoryIdentifier = req.content.categoryIdentifier;
 
-        // Dùng identifier ổn định, không cộng dồn timestamp
-        NSString *baseId = [req.identifier stringByReplacingOccurrencesOfString:@"_kept" withString:@""];
-        NSString *keptId = [NSString stringWithFormat:@"%@_kept", baseId];
+        // 4. Đánh dấu cờ nội bộ trong userInfo để nhận diện trong willPresentNotification
+        NSMutableDictionary *u = [mc.userInfo mutableCopy] ?: [NSMutableDictionary dictionary];
+        u[@"zk_kept"] = @YES;
+        mc.userInfo = u;
 
-        UNNotificationRequest *keptReq = [UNNotificationRequest requestWithIdentifier:keptId
+        // 5. Dùng CHÍNH XÁC ID GỐC của notification (req.identifier) để thay thế đúng vị trí cũ trong danh sách
+        NSString *targetId = req.identifier;
+        UNNotificationRequest *keptReq = [UNNotificationRequest requestWithIdentifier:targetId
                                                                               content:mc
                                                                               trigger:nil];
 
-        // Nạp lại sau 0.3s khi SpringBoard hoàn tất chuyển cảnh
+        // Khôi phục sau 0.3s khi giao diện mở app đã ổn định
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             [[UNUserNotificationCenter currentNotificationCenter] addNotificationRequest:keptReq withCompletionHandler:^(NSError * _Nullable error) {
                 if (!error) {
-                    NSLog(@"[ZaloKeepNotif] Successfully re-pinned quiet notification in stack: %@", keptId);
+                    NSLog(@"[ZaloKeepNotif] Restored notification preserving original date & position: %@", targetId);
                 } else {
-                    NSLog(@"[ZaloKeepNotif] Re-pin failed: %@", error);
+                    NSLog(@"[ZaloKeepNotif] Restore error: %@", error);
                 }
             }];
         });
@@ -218,7 +232,6 @@ static void hookDelegate(Class delClass) {
 }
 
 static void swiz_setDelegate(id self, SEL _cmd, id<UNUserNotificationCenterDelegate> delegate) {
-    // Luôn hook delegate TRƯỚC KHI Apple ghi nhận con trỏ delegate
     if (delegate) {
         hookDelegate([delegate class]);
     }
@@ -232,7 +245,7 @@ static void swiz_setDelegate(id self, SEL _cmd, id<UNUserNotificationCenterDeleg
 // ==========================================
 __attribute__((constructor)) static void initZaloKeepNotif() {
     @autoreleasepool {
-        NSLog(@"[ZaloKeepNotif] Initializing v6 tweak...");
+        NSLog(@"[ZaloKeepNotif] Initializing v7 tweak...");
 
         Class uncClass = objc_getClass("UNUserNotificationCenter");
         if (uncClass) {
