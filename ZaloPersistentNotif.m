@@ -2,6 +2,7 @@
 #import <UIKit/UIKit.h>
 #import <UserNotifications/UserNotifications.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 
 static NSString *const kPrefGroupModeKey = @"ZaloNotif_GroupMode";
 
