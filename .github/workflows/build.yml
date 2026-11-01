@@ -1,0 +1,41 @@
+name: Build ZaloPersistentNotif
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          brew install ldid
+
+      - name: Set up Theos
+        run: |
+          git clone --recursive https://github.com/theos/theos.git ~/theos
+          echo "THEOS=~/theos" >> $GITHUB_ENV
+          curl -LO https://github.com/xybp888/iOS-SDKs/releases/download/iOS-16.5/iPhoneOS16.5.sdk.tar.xz
+          tar -xf iPhoneOS16.5.sdk.tar.xz -C ~/theos/sdks/
+
+      - name: Build Tweak
+        run: |
+          export THEOS=~/theos
+          make package FINALPACKAGE=1
+
+      - name: Inspect output
+        run: |
+          ls -la .theos/obj/debug/ || ls -la .theos/obj/ || true
+          find .theos/ -name "*.dylib" || true
+
+      - name: Upload dylib artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ZaloPersistentNotif-dylib
+          path: .theos/obj/**/*.dylib
