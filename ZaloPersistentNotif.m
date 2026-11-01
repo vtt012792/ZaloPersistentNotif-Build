@@ -37,25 +37,52 @@ static NSString *const kPrefGroupModeKey = @"ZaloNotif_GroupMode";
  Mode 3: 💬 Chỉ gom nhóm chat, tin cá nhân để riêng lẻ
 */
 
+@interface ZKSettingsWindow : UIWindow
+@property (nonatomic, strong) UIButton *settingsButton;
++ (void)zk_openSettings;
+@end
+
+static ZKSettingsWindow *sSettingsWindow = nil;
+
 static void ShowGroupingSettings(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        UIWindow *window = nil;
-        if (@available(iOS 13.0, *)) {
-            for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
-                if ([scene isKindOfClass:[UIWindowScene class]] && scene.activationState == UISceneActivationStateForegroundActive) {
-                    for (UIWindow *w in scene.windows) {
-                        if (w.isKeyWindow) { window = w; break; }
+        UIViewController *presenter = nil;
+        if (sSettingsWindow && sSettingsWindow.rootViewController) {
+            presenter = sSettingsWindow.rootViewController;
+            while (presenter.presentedViewController) {
+                presenter = presenter.presentedViewController;
+            }
+        }
+
+        if (!presenter) {
+            UIWindow *activeWin = nil;
+            if (@available(iOS 13.0, *)) {
+                for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
+                    if ([scene isKindOfClass:[UIWindowScene class]] && scene.activationState == UISceneActivationStateForegroundActive) {
+                        for (UIWindow *w in scene.windows) {
+                            if (w != sSettingsWindow && (w.isKeyWindow || [w isKindOfClass:[UIWindow class]])) {
+                                activeWin = w;
+                                break;
+                            }
+                        }
                     }
                 }
             }
+            if (!activeWin) {
+                for (UIWindow *w in [UIApplication sharedApplication].windows) {
+                    if (w != sSettingsWindow) {
+                        activeWin = w;
+                        break;
+                    }
+                }
+            }
+            presenter = activeWin.rootViewController;
+            while (presenter.presentedViewController) {
+                presenter = presenter.presentedViewController;
+            }
         }
-        if (!window) window = [UIApplication sharedApplication].keyWindow ?: [UIApplication sharedApplication].windows.firstObject;
 
-        UIViewController *rootVC = window.rootViewController;
-        while (rootVC.presentedViewController) {
-            rootVC = rootVC.presentedViewController;
-        }
-        if (!rootVC) return;
+        if (!presenter) return;
 
         NSInteger currentMode = [[NSUserDefaults standardUserDefaults] integerForKey:kPrefGroupModeKey];
 
@@ -90,93 +117,126 @@ static void ShowGroupingSettings(void) {
         [alert addAction:[UIAlertAction actionWithTitle:@"Đóng" style:UIAlertActionStyleCancel handler:nil]];
 
         if (alert.popoverPresentationController) {
-            alert.popoverPresentationController.sourceView = window;
-            alert.popoverPresentationController.sourceRect = CGRectMake(window.bounds.size.width / 2, window.bounds.size.height / 2, 1, 1);
+            alert.popoverPresentationController.sourceView = sSettingsWindow.settingsButton ?: presenter.view;
+            alert.popoverPresentationController.sourceRect = sSettingsWindow.settingsButton ? sSettingsWindow.settingsButton.bounds : CGRectMake(presenter.view.bounds.size.width / 2, presenter.view.bounds.size.height / 2, 1, 1);
         }
 
-        [rootVC presentViewController:alert animated:YES completion:nil];
+        [presenter presentViewController:alert animated:YES completion:nil];
     });
 }
 
-// NÚT BẤM NỔI (FLOATING BUTTON) TRỰC QUAN ĐỂ MỞ MENU CÀI ĐẶT
-@interface ZKFloatingButton : UIButton
-@end
+@implementation ZKSettingsWindow
 
-@implementation ZKFloatingButton
-
-- (instancetype)initWithFrame:(CGRect)frame {
-    self = [super initWithFrame:frame];
-    if (self) {
-        self.backgroundColor = [UIColor colorWithRed:0.0 green:0.45 blue:0.95 alpha:0.85]; // Màu xanh Zalo
-        self.layer.cornerRadius = frame.size.width / 2.0;
-        self.layer.masksToBounds = YES;
-        self.layer.borderWidth = 2.0;
-        self.layer.borderColor = [UIColor whiteColor].CGColor;
-        [self setTitle:@"⚙️" forState:UIControlStateNormal];
-        self.titleLabel.font = [UIFont systemFontOfSize:22];
-
-        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePan:)];
-        [self addGestureRecognizer:pan];
-
-        [self addTarget:self action:@selector(btnTapped) forControlEvents:UIControlEventTouchUpInside];
-    }
-    return self;
-}
-
-- (void)handlePan:(UIPanGestureRecognizer *)pan {
-    UIView *superview = self.superview;
-    if (!superview) return;
-
-    CGPoint translation = [pan translationInView:superview];
-    CGPoint newCenter = CGPointMake(self.center.x + translation.x, self.center.y + translation.y);
-
-    CGFloat halfW = self.bounds.size.width / 2.0;
-    CGFloat halfH = self.bounds.size.height / 2.0;
-    newCenter.x = MAX(halfW, MIN(newCenter.x, superview.bounds.size.width - halfW));
-    newCenter.y = MAX(halfH + 44, MIN(newCenter.y, superview.bounds.size.height - halfH - 34));
-
-    self.center = newCenter;
-    [pan setTranslation:CGPointMake(0, 0) inView:superview];
-
-    if (pan.state == UIGestureRecognizerStateEnded) {
-        CGFloat snapX = (newCenter.x < superview.bounds.size.width / 2.0) ? (halfW + 10) : (superview.bounds.size.width - halfW - 10);
-        [UIView animateWithDuration:0.2 animations:^{
-            self.center = CGPointMake(snapX, newCenter.y);
-        }];
-    }
-}
-
-- (void)btnTapped {
++ (void)zk_openSettings {
     ShowGroupingSettings();
 }
 
+// Xuyên thấu toàn bộ touch ngoại trừ nút ⚙️ và Alert đang hiển thị
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    if (self.settingsButton && !self.settingsButton.hidden) {
+        CGPoint pInBtn = [self.settingsButton convertPoint:point fromView:self];
+        if ([self.settingsButton pointInside:pInBtn withEvent:event]) {
+            return [self.settingsButton hitTest:pInBtn withEvent:event];
+        }
+    }
+    if (self.rootViewController.presentedViewController) {
+        return [super hitTest:point withEvent:event];
+    }
+    return nil; // Cho phép toàn bộ thao tác bàn phím/mã khóa của Zalo diễn ra bình thường
+}
+
 @end
 
-static ZKFloatingButton *sFloatingBtn = nil;
-static void ensureFloatingButton(UIWindow *window) {
-    if (!window) return;
+static void EnsureSettingsWindow(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        if (sFloatingBtn && sFloatingBtn.superview == window) return;
-
-        if (!sFloatingBtn) {
-            CGFloat screenW = [UIScreen mainScreen].bounds.size.width;
-            CGFloat screenH = [UIScreen mainScreen].bounds.size.height;
-            sFloatingBtn = [[ZKFloatingButton alloc] initWithFrame:CGRectMake(screenW - 56, screenH - 180, 46, 46)];
+        UIWindowScene *activeScene = nil;
+        if (@available(iOS 13.0, *)) {
+            for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
+                if ([s isKindOfClass:[UIWindowScene class]]) {
+                    UIWindowScene *ws = (UIWindowScene *)s;
+                    if (ws.activationState == UISceneActivationStateForegroundActive) {
+                        activeScene = ws;
+                        break;
+                    }
+                    if (!activeScene) activeScene = ws;
+                }
+            }
         }
 
-        [window addSubview:sFloatingBtn];
-        [window bringSubviewToFront:sFloatingBtn];
+        CGRect screenBounds = [UIScreen mainScreen].bounds;
+        CGFloat topInset = 54.0;
+        if (@available(iOS 11.0, *)) {
+            for (UIWindow *w in [UIApplication sharedApplication].windows) {
+                if (w != sSettingsWindow && w.safeAreaInsets.top > 20) {
+                    topInset = w.safeAreaInsets.top + 6.0;
+                    break;
+                }
+            }
+        }
+
+        CGRect btnFrame = CGRectMake(screenBounds.size.width - 54, topInset, 44, 44);
+
+        if (!sSettingsWindow) {
+            if (@available(iOS 13.0, *)) {
+                if (activeScene) {
+                    sSettingsWindow = [[ZKSettingsWindow alloc] initWithWindowScene:activeScene];
+                }
+            }
+            if (!sSettingsWindow) {
+                sSettingsWindow = [[ZKSettingsWindow alloc] initWithFrame:screenBounds];
+            } else {
+                sSettingsWindow.frame = screenBounds;
+            }
+
+            sSettingsWindow.windowLevel = UIWindowLevelAlert + 1000;
+            sSettingsWindow.backgroundColor = [UIColor clearColor];
+
+            UIViewController *rootVC = [[UIViewController alloc] init];
+            rootVC.view.backgroundColor = [UIColor clearColor];
+            rootVC.view.userInteractionEnabled = YES;
+
+            UIButton *btn = [UIButton buttonWithType:UIButtonTypeCustom];
+            btn.frame = btnFrame;
+            btn.backgroundColor = [UIColor colorWithRed:0.0 green:0.41 blue:0.95 alpha:0.92];
+            btn.layer.cornerRadius = 22.0;
+            btn.layer.masksToBounds = YES;
+            btn.layer.borderWidth = 2.0;
+            btn.layer.borderColor = [UIColor whiteColor].CGColor;
+            [btn setTitle:@"⚙️" forState:UIControlStateNormal];
+            btn.titleLabel.font = [UIFont systemFontOfSize:22];
+            [btn addTarget:[ZKSettingsWindow class] action:@selector(zk_openSettings) forControlEvents:UIControlEventTouchUpInside];
+
+            [rootVC.view addSubview:btn];
+            sSettingsWindow.rootViewController = rootVC;
+            sSettingsWindow.settingsButton = btn;
+        } else {
+            if (@available(iOS 13.0, *)) {
+                if (activeScene && sSettingsWindow.windowScene != activeScene) {
+                    sSettingsWindow.windowScene = activeScene;
+                }
+            }
+            sSettingsWindow.frame = screenBounds;
+            if (sSettingsWindow.settingsButton) {
+                sSettingsWindow.settingsButton.frame = btnFrame;
+            }
+        }
+
+        sSettingsWindow.hidden = NO;
+        if (sSettingsWindow.superview) {
+            [sSettingsWindow.superview bringSubviewToFront:sSettingsWindow];
+        }
     });
 }
 
-@interface UIWindow (ZKFloatingHook)
+// Hook UIViewController viewDidAppear để đảm bảo xuất hiện cố định ngay cả khi vào màn hình khóa Zalo
+@interface UIViewController (ZKLockscreenHook)
 @end
 
-@implementation UIWindow (ZKFloatingHook)
+@implementation UIViewController (ZKLockscreenHook)
 
-- (void)zk_makeKeyAndVisible {
-    [self zk_makeKeyAndVisible];
-    ensureFloatingButton(self);
+- (void)zk_viewDidAppear:(BOOL)animated {
+    [self zk_viewDidAppear:animated];
+    EnsureSettingsWindow();
 }
 
 @end
@@ -255,12 +315,12 @@ static NSString *zk_determineThreadIdentifier(UNNotificationContent *content) {
 }
 
 - (void)zk_removePendingNotificationRequestsWithIdentifiers:(NSArray<NSString *> *)identifiers {
-    NSLog(@"[ZaloKeepNotif] Blocked removePendingNotificationRequestsWithIdentifiers");
+    NSLog(@"[ZaloKeepNotif] Blocked removePendingNotificationRequestsWithIdentifiers: count=%lu", (unsigned long)identifiers.count);
 }
 
-- (void)zk_setBadgeCount:(NSInteger)newBadgeCount withCompletionHandler:(void (^)(NSError *))completionHandler {
+- (void)zk_setBadgeCount:(NSInteger)newBadgeCount withCompletionHandler:(void(^)(NSError *error))completionHandler {
     if (newBadgeCount <= 0) {
-        NSLog(@"[ZaloKeepNotif] Suppressed setBadgeCount:%ld", (long)newBadgeCount);
+        NSLog(@"[ZaloKeepNotif] Suppressed setBadgeCount:%ld (to prevent Lockscreen bulletin wipe)", (long)newBadgeCount);
         if (completionHandler) completionHandler(nil);
         return;
     }
@@ -270,7 +330,7 @@ static NSString *zk_determineThreadIdentifier(UNNotificationContent *content) {
 @end
 
 // ==========================================
-// 2. CHẶN XÓA THÔNG BÁO TỪ UIApplication (Badge)
+// 2. CHẶN XÓA BADGE CỦA UIApplication
 // ==========================================
 @interface UIApplication (ZaloKeepNotif)
 @end
@@ -288,53 +348,62 @@ static NSString *zk_determineThreadIdentifier(UNNotificationContent *content) {
 @end
 
 // ==========================================
-// 3. CASCADING MONOTONIC RE-ORDERING ENGINE (BẢO TOÀN THỨ TỰ 100%)
+// 3. TẠO BẢN SAO CONTENT HOÀN HẢO (KHÔNG BANNER / KHÔNG SOUND)
 // ==========================================
 static UNMutableNotificationContent *zk_prepareContentCopy(UNNotificationContent *origContent) {
-    UNMutableNotificationContent *mc = [origContent mutableCopy];
-    mc.sound = nil; // Tắt âm thanh
-    mc.attachments = @[]; // Xóa attachments tạm tránh lỗi file temp
+    UNMutableNotificationContent *newContent = [[UNMutableNotificationContent alloc] init];
 
-    // Chống sáng màn hình và chống bung popup
-    @try { [mc setValue:@YES forKey:@"shouldSuppressScreenLightUp"]; } @catch (NSException *e) {}
-    @try { [mc setValue:@YES forKey:@"shouldSuppressDefaultAction"]; } @catch (NSException *e) {}
+    newContent.title = origContent.title ?: @"";
+    newContent.subtitle = origContent.subtitle ?: @"";
+    newContent.body = origContent.body ?: @"";
+    newContent.categoryIdentifier = origContent.categoryIdentifier ?: @"";
+    newContent.attachments = origContent.attachments ?: @[];
 
-    // Bảo tồn gom nhóm theo mode đã chọn
-    mc.threadIdentifier = zk_determineThreadIdentifier(origContent);
-    mc.categoryIdentifier = origContent.categoryIdentifier;
+    // Tự động gom cụm theo Mode đã chọn trong cài đặt
+    newContent.threadIdentifier = zk_determineThreadIdentifier(origContent);
 
-    // Đánh dấu cờ nội bộ để willPresentNotification nhận diện và dập tắt hoàn toàn popup
-    NSMutableDictionary *u = [mc.userInfo mutableCopy] ?: [NSMutableDictionary dictionary];
-    u[@"zk_kept"] = @YES;
-    mc.userInfo = u;
+    // QUAN TRỌNG:
+    // sound = nil để SpringBoard hoàn toàn im lặng, không rung chuông
+    newContent.sound = nil;
 
-    return mc;
+    NSMutableDictionary *dict = [NSMutableDictionary dictionary];
+    if (origContent.userInfo) {
+        [dict addEntriesFromDictionary:origContent.userInfo];
+    }
+    // Cờ đánh dấu thông báo này được dylib phục hồi, chặn willPresentNotification tạo popup
+    dict[@"zk_kept"] = @YES;
+    dict[@"zk_restored_at"] = [NSNumber numberWithDouble:[[NSDate date] timeIntervalSince1970]];
+    newContent.userInfo = dict;
+
+    return newContent;
 }
 
-// Hàm re-post tuần tự đơn điệu để đảm bảo thứ tự thời gian chuẩn xác trong SQLite của usernoted
-static void zk_sequentialRepost(NSArray<UNNotificationRequest *> *requests, NSUInteger index, void (^allDone)(void)) {
-    if (index >= requests.count) {
-        if (allDone) allDone();
+// ==========================================
+// 4. CASCADE MONOTONIC RE-ORDERING ENGINE (20ms tuần tự)
+// ==========================================
+static void zk_sequentialRepost(NSArray<UNNotificationRequest *> *queue, NSUInteger index, void (^onComplete)(void)) {
+    if (index >= queue.count) {
+        if (onComplete) onComplete();
         return;
     }
 
-    UNNotificationRequest *req = requests[index];
+    UNNotificationRequest *req = queue[index];
     [[UNUserNotificationCenter currentNotificationCenter] addNotificationRequest:req withCompletionHandler:^(NSError * _Nullable error) {
         if (error) {
-            NSLog(@"[ZaloKeepNotif] Sequential re-post failed for id: %@, error: %@", req.identifier, error);
+            NSLog(@"[ZaloKeepNotif] Error reposting request [%lu/%lu] id=%@: %@", (unsigned long)index, (unsigned long)queue.count, req.identifier, error);
         } else {
-            NSLog(@"[ZaloKeepNotif] Monotonic update success (%lu/%lu): %@", (unsigned long)(index + 1), (unsigned long)requests.count, req.identifier);
+            NSLog(@"[ZaloKeepNotif] Successfully reposted request [%lu/%lu] id=%@", (unsigned long)index, (unsigned long)queue.count, req.identifier);
         }
 
-        // Khoảng trễ 20ms để usernoted tạo mốc thời gian millisecond tăng dần tuyệt đối
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.020 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            zk_sequentialRepost(requests, index + 1, allDone);
+        // Delay 20ms giữa mỗi thông báo để usernoted gán monotonic timestamp tăng dần
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.02 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            zk_sequentialRepost(queue, index + 1, onComplete);
         });
     }];
 }
 
 // ==========================================
-// 4. HOOK DELEGATE
+// 5. HOOK DELEGATE CỦA UNUserNotificationCenter
 // ==========================================
 static void (*orig_setDelegate)(id, SEL, id<UNUserNotificationCenterDelegate>) = NULL;
 static void (*orig_willPresent)(id, SEL, UNUserNotificationCenter *, UNNotification *, void (^)(UNNotificationPresentationOptions)) = NULL;
@@ -342,36 +411,28 @@ static void (*orig_didReceive)(id, SEL, UNUserNotificationCenter *, UNNotificati
 static BOOL (*orig_respondsToSelector)(id, SEL, SEL) = NULL;
 
 static void swiz_willPresent(id self, SEL _cmd, UNUserNotificationCenter *center, UNNotification *notification, void (^completionHandler)(UNNotificationPresentationOptions)) {
-    // Với tin nhắn re-post: TUYỆT ĐỐI KHÔNG BẬT POPUP/BANNER/SOUND
     NSDictionary *userInfo = notification.request.content.userInfo;
+
+    // Chặn triệt để popup banner khi thông báo được dylib ghim lại
     if (userInfo && userInfo[@"zk_kept"]) {
-        UNNotificationPresentationOptions keptOpts = 0;
-        if (@available(iOS 14.0, *)) {
-            keptOpts = (1 << 3); // UNNotificationPresentationOptionList ONLY
-        }
+        NSLog(@"[ZaloKeepNotif] Suppressed in-app popup banner for restored notification id=%@", notification.request.identifier);
         if (completionHandler) {
-            completionHandler(keptOpts);
+            completionHandler((1 << 3)); // Chỉ hiển thị trong danh sách thông báo, 0 banner, 0 sound
         }
         return;
     }
 
     if (orig_willPresent) {
-        orig_willPresent(self, _cmd, center, notification, ^(UNNotificationPresentationOptions options) {
-            options |= (1 << 3);
-            if (completionHandler) {
-                completionHandler(options);
-            }
-        });
-    } else {
-        UNNotificationPresentationOptions opts = (1 << 4) | (1 << 3) | (1 << 2) | (1 << 1) | (1 << 0);
-        if (completionHandler) {
-            completionHandler(opts);
-        }
+        orig_willPresent(self, _cmd, center, notification, completionHandler);
+    } else if (completionHandler) {
+        completionHandler(UNNotificationPresentationOptionBadge | UNNotificationPresentationOptionSound | UNNotificationPresentationOptionAlert);
     }
 }
 
 static void swiz_didReceive(id self, SEL _cmd, UNUserNotificationCenter *center, UNNotificationResponse *response, void (^completionHandler)(void)) {
-    // 1. Cho Zalo xử lý chuyển vào phòng chat bình thường
+    NSLog(@"[ZaloKeepNotif] Intercepted tap/action on notification id=%@", response.notification.request.identifier);
+
+    // 1. Chạy logic xử lý gốc của Zalo để mở đúng cuộc trò chuyện
     if (orig_didReceive) {
         orig_didReceive(self, _cmd, center, response, completionHandler);
     } else if (completionHandler) {
@@ -495,19 +556,39 @@ static void swiz_setDelegate(id self, SEL _cmd, id<UNUserNotificationCenterDeleg
 }
 
 // ==========================================
-// 5. CONSTRUCTOR
+// 6. CONSTRUCTOR
 // ==========================================
 __attribute__((constructor)) static void initZaloKeepNotif() {
     @autoreleasepool {
-        NSLog(@"[ZaloKeepNotif] Initializing v10 tweak (Floating Button + Pure Cascading Monotonic Engine)...");
+        NSLog(@"[ZaloKeepNotif] Initializing v11 tweak (Fixed Overlay Button on Zalo Lockscreen + Cascading Monotonic Engine)...");
 
-        // Hook UIWindow makeKeyAndVisible để gắn Nút Nổi trực quan
-        Class winClass = objc_getClass("UIWindow");
-        if (winClass) {
-            SwizzleMethod(winClass,
-                          @selector(makeKeyAndVisible),
-                          @selector(zk_makeKeyAndVisible));
+        // Hook UIViewController viewDidAppear để gắn nút cố định ngay trên màn hình khóa Zalo
+        Class vcClass = objc_getClass("UIViewController");
+        if (vcClass) {
+            SwizzleMethod(vcClass,
+                          @selector(viewDidAppear:),
+                          @selector(zk_viewDidAppear:));
         }
+
+        // Lắng nghe notification khi ứng dụng active hoặc window hiển thị
+        [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
+                                                          object:nil
+                                                           queue:[NSOperationQueue mainQueue]
+                                                      usingBlock:^(NSNotification * _Nonnull note) {
+            EnsureSettingsWindow();
+        }];
+
+        [[NSNotificationCenter defaultCenter] addObserverForName:UIWindowDidBecomeVisibleNotification
+                                                          object:nil
+                                                           queue:[NSOperationQueue mainQueue]
+                                                      usingBlock:^(NSNotification * _Nonnull note) {
+            EnsureSettingsWindow();
+        }];
+
+        // Đảm bảo hiển thị sớm trong chu kỳ khởi động
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ EnsureSettingsWindow(); });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ EnsureSettingsWindow(); });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ EnsureSettingsWindow(); });
 
         Class uncClass = objc_getClass("UNUserNotificationCenter");
         if (uncClass) {
