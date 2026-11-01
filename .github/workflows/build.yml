@@ -15,11 +15,11 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang lld llvm
+          sudo apt-get install -y clang lld llvm xz-utils
 
       - name: Install ldid
         run: |
-          curl -sLo ldid https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_linux_x86_64 || true
+          curl -sL https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_linux_x86_64 -o ldid || true
           if [ -f ldid ]; then
             chmod +x ldid
             sudo mv ldid /usr/local/bin/
@@ -27,10 +27,10 @@ jobs:
 
       - name: Download iOS SDK
         run: |
-          curl -LO https://github.com/xybp888/iOS-SDKs/releases/download/iOS-16.5/iPhoneOS16.5.sdk.tar.xz
-          mkdir -p /tmp/sdk
-          tar -xf iPhoneOS16.5.sdk.tar.xz -C /tmp/sdk/
-          echo "SDK_PATH=/tmp/sdk/iPhoneOS16.5.sdk" >> $GITHUB_ENV
+          git clone --depth=1 https://github.com/theos/sdks /tmp/sdks
+          SDK=$(find /tmp/sdks -name "iPhoneOS*.sdk" -type d | sort -V | tail -n 1)
+          echo "Found SDK: $SDK"
+          echo "SDK_PATH=$SDK" >> $GITHUB_ENV
 
       - name: Compile Dylib
         run: |
