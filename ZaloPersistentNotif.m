@@ -83,45 +83,70 @@ static void (*orig_willPresent)(id, SEL, UNUserNotificationCenter *, UNNotificat
 static void (*orig_didReceive)(id, SEL, UNUserNotificationCenter *, UNNotificationResponse *, void (^)(void));
 
 static void swiz_willPresent(id self, SEL _cmd, UNUserNotificationCenter *center, UNNotification *notification, void (^completionHandler)(UNNotificationPresentationOptions)) {
-    // Luôn ghi vào Notification List trên Lockscreen
-    UNNotificationPresentationOptions opts = UNNotificationPresentationOptionList | UNNotificationPresentationOptionBadge;
-
-    if (![notification.request.identifier hasSuffix:@"_kept"]) {
-        // Tin nhắn mới đến bình thường: bật chuông + banner
-        opts |= (UNNotificationPresentationOptionBanner | UNNotificationPresentationOptionSound);
+    // Với tin nhắn re-post (_kept): chỉ thêm vào Notification Center/Lockscreen, tuyệt đối KHÔNG phát âm thanh hoặc rung
+    if ([notification.request.identifier containsString:@"_kept"]) {
+        UNNotificationPresentationOptions keptOpts = UNNotificationPresentationOptionList;
+        if (@available(iOS 14.0, *)) {
+            // iOS 14+ UNNotificationPresentationOptionList
+            keptOpts = UNNotificationPresentationOptionList;
+        }
+        if (completionHandler) {
+            completionHandler(keptOpts);
+        }
+        return;
     }
 
-    if (completionHandler) {
-        completionHandler(opts);
+    // Với tin nhắn mới đến bình thường: gọi delegate gốc hoặc bật đầy đủ banner + sound + list
+    if (orig_willPresent) {
+        orig_willPresent(self, _cmd, center, notification, ^(UNNotificationPresentationOptions options) {
+            // Đảm bảo luôn giữ trong danh sách màn hình khóa / notification center
+            options |= UNNotificationPresentationOptionList;
+            if (completionHandler) {
+                completionHandler(options);
+            }
+        });
+    } else {
+        UNNotificationPresentationOptions opts = UNNotificationPresentationOptionList | UNNotificationPresentationOptionBanner | UNNotificationPresentationOptionSound | UNNotificationPresentationOptionBadge;
+        if (completionHandler) {
+            completionHandler(opts);
+        }
     }
 }
 
 static void swiz_didReceive(id self, SEL _cmd, UNUserNotificationCenter *center, UNNotificationResponse *response, void (^completionHandler)(void)) {
     UNNotificationRequest *req = response.notification.request;
 
-    // Cho Zalo xử lý chuyển vào phòng chat
+    // 1. Cho Zalo xử lý chuyển tiếp vào đúng phòng chat hoặc luồng xem tin nhắn bình thường
     if (orig_didReceive) {
         orig_didReceive(self, _cmd, center, response, completionHandler);
     } else if (completionHandler) {
         completionHandler();
     }
 
-    // Khi người dùng bấm vào noti trên lockscreen để đọc, SpringBoard tự xóa noti đó.
-    // Ta clone nội dung và dùng Local Trigger để ghim lại thông báo lên Lockscreen:
+    // 2. Khi người dùng bấm vào noti trên lockscreen để xem tin nhắn,
+    // SpringBoard / iOS mặc định sẽ xóa (dismiss) notification khỏi Lockscreen.
+    // Để giữ lại trên Lockscreen cho đến khi người dùng tự tay xóa:
+    // Clone nội dung notification và tái tạo lại bằng Local Trigger tức thì.
     if (req && req.content) {
         UNMutableNotificationContent *mc = [req.content mutableCopy];
-        mc.sound = nil; // Không phát lại âm thanh
+        mc.sound = nil; // Không phát lại âm thanh, tránh làm phiền khi đang đọc
 
-        UNTimeIntervalNotificationTrigger *trigger = [UNTimeIntervalNotificationTrigger triggerWithTimeInterval:0.2 repeats:NO];
-        NSString *keptId = [NSString stringWithFormat:@"%@_kept", req.identifier];
+        // Giữ nguyên identifier gốc kèm hậu tố timestamp để tránh trùng lặp id
+        NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+        NSString *keptId = [NSString stringWithFormat:@"%@_kept_%.0f", req.identifier, now];
+
+        // Trigger sau 0.5s - 1.0s để đảm bảo SpringBoard hoàn tất việc xoá noti cũ trước khi noti mới được ghim lên
+        UNTimeIntervalNotificationTrigger *trigger = [UNTimeIntervalNotificationTrigger triggerWithTimeInterval:1.0 repeats:NO];
         UNNotificationRequest *keptReq = [UNNotificationRequest requestWithIdentifier:keptId
                                                                               content:mc
                                                                               trigger:trigger];
 
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             [[UNUserNotificationCenter currentNotificationCenter] addNotificationRequest:keptReq withCompletionHandler:^(NSError * _Nullable error) {
                 if (!error) {
-                    NSLog(@"[ZaloKeepNotif] Reposted notification to Lockscreen: %@", keptId);
+                    NSLog(@"[ZaloKeepNotif] Successfully re-pinned notification to Lockscreen: %@", keptId);
+                } else {
+                    NSLog(@"[ZaloKeepNotif] Failed to re-pin notification: %@", error);
                 }
             }];
         });
