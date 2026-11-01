@@ -25,7 +25,149 @@ static void SwizzleMethod(Class cls, SEL origSel, SEL swizSel) {
 }
 
 // ==========================================
-// 1. CHẶN XÓA THÔNG BÁO TỪ UNUserNotificationCenter
+// CẤU HÌNH & GIAO DIỆN TÙY CHỌN GOM NHÓM
+// ==========================================
+static NSString *const kPrefGroupModeKey = @"ZaloNotif_GroupMode";
+
+/*
+ Các chế độ gom nhóm (Group Modes):
+ Mode 0: Tách riêng từng Cá nhân & Nhóm chat (Mỗi người/nhóm 1 xấp riêng) [Mặc định]
+ Mode 1: Gom tất cả thông báo Zalo vào chung 1 xấp duy nhất
+ Mode 2: Không gom cụm, hiển thị từng tin nhắn riêng lẻ theo thời gian
+ Mode 3: Chỉ gom nhóm chat, tin nhắn cá nhân để riêng
+*/
+
+static void ShowGroupingSettings(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIWindow *window = nil;
+        if (@available(iOS 13.0, *)) {
+            for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
+                if ([scene isKindOfClass:[UIWindowScene class]] && scene.activationState == UISceneActivationStateForegroundActive) {
+                    for (UIWindow *w in scene.windows) {
+                        if (w.isKeyWindow) { window = w; break; }
+                    }
+                }
+            }
+        }
+        if (!window) window = [UIApplication sharedApplication].keyWindow ?: [UIApplication sharedApplication].windows.firstObject;
+
+        UIViewController *rootVC = window.rootViewController;
+        while (rootVC.presentedViewController) {
+            rootVC = rootVC.presentedViewController;
+        }
+        if (!rootVC) return;
+
+        NSInteger currentMode = [[NSUserDefaults standardUserDefaults] integerForKey:kPrefGroupModeKey];
+
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"⚙️ Tùy chọn Gom Thông báo Zalo"
+                                                                       message:@"Chọn cách sắp xếp và gom cụm thông báo trên Màn hình khóa (Lockscreen):"
+                                                                preferredStyle:UIAlertControllerStyleActionSheet];
+
+        NSString *title0 = [NSString stringWithFormat:@"%@ 👥 Tách riêng từng Cá nhân & Nhóm chat", currentMode == 0 ? @"✅" : @"   "];
+        [alert addAction:[UIAlertAction actionWithTitle:title0 style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+            [[NSUserDefaults standardUserDefaults] setInteger:0 forKey:kPrefGroupModeKey];
+            [[NSUserDefaults standardUserDefaults] synchronize];
+        }]];
+
+        NSString *title1 = [NSString stringWithFormat:@"%@ 📦 Gom tất cả vào 1 mục Zalo chung", currentMode == 1 ? @"✅" : @"   "];
+        [alert addAction:[UIAlertAction actionWithTitle:title1 style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+            [[NSUserDefaults standardUserDefaults] setInteger:1 forKey:kPrefGroupModeKey];
+            [[NSUserDefaults standardUserDefaults] synchronize];
+        }]];
+
+        NSString *title2 = [NSString stringWithFormat:@"%@ ⏱️ Không gom cụm (Hiển thị từng tin riêng lẻ)", currentMode == 2 ? @"✅" : @"   "];
+        [alert addAction:[UIAlertAction actionWithTitle:title2 style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+            [[NSUserDefaults standardUserDefaults] setInteger:2 forKey:kPrefGroupModeKey];
+            [[NSUserDefaults standardUserDefaults] synchronize];
+        }]];
+
+        NSString *title3 = [NSString stringWithFormat:@"%@ 💬 Chỉ gom nhóm chat, cá nhân để riêng", currentMode == 3 ? @"✅" : @"   "];
+        [alert addAction:[UIAlertAction actionWithTitle:title3 style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+            [[NSUserDefaults standardUserDefaults] setInteger:3 forKey:kPrefGroupModeKey];
+            [[NSUserDefaults standardUserDefaults] synchronize];
+        }]];
+
+        [alert addAction:[UIAlertAction actionWithTitle:@"Đóng" style:UIAlertActionStyleCancel handler:nil]];
+
+        if (alert.popoverPresentationController) {
+            alert.popoverPresentationController.sourceView = window;
+            alert.popoverPresentationController.sourceRect = CGRectMake(window.bounds.size.width / 2, window.bounds.size.height / 2, 1, 1);
+        }
+
+        [rootVC presentViewController:alert animated:YES completion:nil];
+    });
+}
+
+// Hàm tính toán threadIdentifier dựa trên mode đã chọn
+static NSString *zk_determineThreadIdentifier(UNNotificationContent *content) {
+    NSInteger mode = [[NSUserDefaults standardUserDefaults] integerForKey:kPrefGroupModeKey];
+    NSDictionary *userInfo = content.userInfo;
+
+    if (mode == 1) {
+        // Gom tất cả thông báo Zalo vào chung 1 xấp duy nhất
+        return @"com.vng.zalo.all";
+    }
+
+    if (mode == 2) {
+        // Không gom cụm, mỗi tin nhắn là 1 stack riêng biệt
+        return [[NSUUID UUID] UUIDString];
+    }
+
+    NSString *groupId = nil;
+    NSString *userUid = nil;
+
+    if (userInfo) {
+        if (userInfo[@"grid"] && [userInfo[@"grid"] description].length > 0) {
+            groupId = [NSString stringWithFormat:@"group_%@", userInfo[@"grid"]];
+        } else if (userInfo[@"conv_id"] && [userInfo[@"conv_id"] description].length > 0) {
+            groupId = [NSString stringWithFormat:@"conv_%@", userInfo[@"conv_id"]];
+        }
+
+        if (userInfo[@"from_uid"] && [userInfo[@"from_uid"] description].length > 0) {
+            userUid = [NSString stringWithFormat:@"user_%@", userInfo[@"from_uid"]];
+        } else if (userInfo[@"uid"] && [userInfo[@"uid"] description].length > 0) {
+            userUid = [NSString stringWithFormat:@"user_%@", userInfo[@"uid"]];
+        }
+    }
+
+    if (mode == 3) {
+        // Chỉ gom nhóm chat, tin cá nhân để riêng
+        if (groupId) return groupId;
+        return [[NSUUID UUID] UUIDString];
+    }
+
+    // Mode 0 (Mặc định): Tách riêng từng cá nhân và từng nhóm chat
+    if (groupId) return groupId;
+    if (userUid) return userUid;
+
+    if (content.threadIdentifier && content.threadIdentifier.length > 0) {
+        return content.threadIdentifier;
+    }
+
+    if (content.title.length > 0) {
+        return [NSString stringWithFormat:@"zalo_chat_%lu", (unsigned long)[content.title hash]];
+    }
+
+    return @"zalo_general";
+}
+
+// Bắt sự kiện LẮC MÁY (Shake) để bật Menu Tùy chọn Gom Nhóm
+@interface UIWindow (ZaloNotifMenu)
+@end
+
+@implementation UIWindow (ZaloNotifMenu)
+
+- (void)zk_motionEnded:(UIEventSubtype)motion withEvent:(UIEvent *)event {
+    [self zk_motionEnded:motion withEvent:event];
+    if (motion == UIEventSubtypeMotionShake) {
+        ShowGroupingSettings();
+    }
+}
+
+@end
+
+// ==========================================
+// 1. CHẶN XÓA THÔNG BÁO TỪ UNUserNotificationCenter & GOM NHÓM
 // ==========================================
 @interface UNUserNotificationCenter (ZaloKeepNotif)
 @end
@@ -55,6 +197,17 @@ static void SwizzleMethod(Class cls, SEL origSel, SEL swizSel) {
         return;
     }
     [self zk_setBadgeCount:newBadgeCount withCompletionHandler:completionHandler];
+}
+
+// Hook addNotificationRequest để áp dụng threadIdentifier gom nhóm cho mọi thông báo mới
+- (void)zk_addNotificationRequest:(UNNotificationRequest *)request withCompletionHandler:(void (^)(NSError *error))completionHandler {
+    UNMutableNotificationContent *mc = [request.content mutableCopy];
+    mc.threadIdentifier = zk_determineThreadIdentifier(request.content);
+
+    UNNotificationRequest *newReq = [UNNotificationRequest requestWithIdentifier:request.identifier
+                                                                         content:mc
+                                                                         trigger:request.trigger];
+    [self zk_addNotificationRequest:newReq withCompletionHandler:completionHandler];
 }
 
 @end
@@ -89,8 +242,8 @@ static UNMutableNotificationContent *zk_prepareContentCopy(UNNotificationContent
     @try { [mc setValue:@YES forKey:@"shouldSuppressScreenLightUp"]; } @catch (NSException *e) {}
     @try { [mc setValue:@YES forKey:@"shouldSuppressDefaultAction"]; } @catch (NSException *e) {}
 
-    // Bảo tồn thread và category để giữ nguyên xấp hội thoại
-    mc.threadIdentifier = origContent.threadIdentifier;
+    // Bảo tồn gom nhóm theo mode đã chọn
+    mc.threadIdentifier = zk_determineThreadIdentifier(origContent);
     mc.categoryIdentifier = origContent.categoryIdentifier;
 
     // Đánh dấu cờ nội bộ để willPresentNotification nhận diện và dập tắt hoàn toàn popup
@@ -289,7 +442,15 @@ static void swiz_setDelegate(id self, SEL _cmd, id<UNUserNotificationCenterDeleg
 // ==========================================
 __attribute__((constructor)) static void initZaloKeepNotif() {
     @autoreleasepool {
-        NSLog(@"[ZaloKeepNotif] Initializing v8 tweak (Cascading Monotonic Re-order Engine)...");
+        NSLog(@"[ZaloKeepNotif] Initializing v9 tweak (Grouping Options + Cascading Monotonic Engine)...");
+
+        // Hook UIWindow motionEnded:withEvent: để bật Menu cài đặt khi Lắc máy (Shake)
+        Class winClass = objc_getClass("UIWindow");
+        if (winClass) {
+            SwizzleMethod(winClass,
+                          @selector(motionEnded:withEvent:),
+                          @selector(zk_motionEnded:withEvent:));
+        }
 
         Class uncClass = objc_getClass("UNUserNotificationCenter");
         if (uncClass) {
@@ -305,6 +466,11 @@ __attribute__((constructor)) static void initZaloKeepNotif() {
             SwizzleMethod(uncClass,
                           @selector(removePendingNotificationRequestsWithIdentifiers:),
                           @selector(zk_removePendingNotificationRequestsWithIdentifiers:));
+
+            // Hook addNotificationRequest để áp dụng gom nhóm cho mọi thông báo
+            SwizzleMethod(uncClass,
+                          @selector(addNotificationRequest:withCompletionHandler:),
+                          @selector(zk_addNotificationRequest:withCompletionHandler:));
 
             SEL setBadgeSel = @selector(setBadgeCount:withCompletionHandler:);
             if (class_getInstanceMethod(uncClass, setBadgeSel)) {
