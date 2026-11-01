@@ -3,6 +3,9 @@
 #import <UserNotifications/UserNotifications.h>
 #import <objc/runtime.h>
 
+// ==========================================
+// SWIZZLING HELPER
+// ==========================================
 static void SwizzleMethod(Class cls, SEL origSel, SEL swizSel) {
     if (!cls) return;
     Method origMethod = class_getInstanceMethod(cls, origSel);
@@ -65,7 +68,6 @@ static void SwizzleMethod(Class cls, SEL origSel, SEL swizSel) {
 @implementation UIApplication (ZaloKeepNotif)
 
 - (void)zk_setApplicationIconBadgeNumber:(NSInteger)badgeNumber {
-    // Không gán 0 (tránh iOS clear lockscreen), và tuyệt đối không gán số âm
     if (badgeNumber <= 0) {
         NSLog(@"[ZaloKeepNotif] Suppressed setApplicationIconBadgeNumber:%ld", (long)badgeNumber);
         return;
@@ -78,35 +80,31 @@ static void SwizzleMethod(Class cls, SEL origSel, SEL swizSel) {
 // ==========================================
 // 3. HOOK DELEGATE (HIỂN THỊ VÀ GHIM LẠI KHI CLICK ĐỌC)
 // ==========================================
-static void (*orig_setDelegate)(id, SEL, id<UNUserNotificationCenterDelegate>);
-static void (*orig_willPresent)(id, SEL, UNUserNotificationCenter *, UNNotification *, void (^)(UNNotificationPresentationOptions));
-static void (*orig_didReceive)(id, SEL, UNUserNotificationCenter *, UNNotificationResponse *, void (^)(void));
+static void (*orig_setDelegate)(id, SEL, id<UNUserNotificationCenterDelegate>) = NULL;
+static void (*orig_willPresent)(id, SEL, UNUserNotificationCenter *, UNNotification *, void (^)(UNNotificationPresentationOptions)) = NULL;
+static void (*orig_didReceive)(id, SEL, UNUserNotificationCenter *, UNNotificationResponse *, void (^)(void)) = NULL;
 
 static void swiz_willPresent(id self, SEL _cmd, UNUserNotificationCenter *center, UNNotification *notification, void (^completionHandler)(UNNotificationPresentationOptions)) {
-    // Với tin nhắn re-post (_kept): chỉ thêm vào Notification Center/Lockscreen, tuyệt đối KHÔNG phát âm thanh hoặc rung
+    // Với tin nhắn re-post (_kept): KHÔNG phát âm thanh, nhưng BẮT BUỘC phải bật Banner + List để hiện lên Lockscreen!
     if ([notification.request.identifier containsString:@"_kept"]) {
-        UNNotificationPresentationOptions keptOpts = UNNotificationPresentationOptionList;
-        if (@available(iOS 14.0, *)) {
-            // iOS 14+ UNNotificationPresentationOptionList
-            keptOpts = UNNotificationPresentationOptionList;
-        }
+        // UNNotificationPresentationOptionList (1<<3) | UNNotificationPresentationOptionBanner (1<<4) | UNNotificationPresentationOptionAlert (1<<2) | UNNotificationPresentationOptionBadge (1<<0)
+        UNNotificationPresentationOptions keptOpts = (1 << 4) | (1 << 3) | (1 << 2) | (1 << 0);
         if (completionHandler) {
             completionHandler(keptOpts);
         }
         return;
     }
 
-    // Với tin nhắn mới đến bình thường: gọi delegate gốc hoặc bật đầy đủ banner + sound + list
+    // Tin nhắn mới đến bình thường: gọi delegate gốc hoặc cho phép hiển thị đầy đủ
     if (orig_willPresent) {
         orig_willPresent(self, _cmd, center, notification, ^(UNNotificationPresentationOptions options) {
-            // Đảm bảo luôn giữ trong danh sách màn hình khóa / notification center
-            options |= UNNotificationPresentationOptionList;
+            options |= ((1 << 4) | (1 << 3) | (1 << 2) | (1 << 0));
             if (completionHandler) {
                 completionHandler(options);
             }
         });
     } else {
-        UNNotificationPresentationOptions opts = UNNotificationPresentationOptionList | UNNotificationPresentationOptionBanner | UNNotificationPresentationOptionSound | UNNotificationPresentationOptionBadge;
+        UNNotificationPresentationOptions opts = (1 << 4) | (1 << 3) | (1 << 2) | (1 << 1) | (1 << 0);
         if (completionHandler) {
             completionHandler(opts);
         }
@@ -115,36 +113,46 @@ static void swiz_willPresent(id self, SEL _cmd, UNUserNotificationCenter *center
 
 static void swiz_didReceive(id self, SEL _cmd, UNUserNotificationCenter *center, UNNotificationResponse *response, void (^completionHandler)(void)) {
     UNNotificationRequest *req = response.notification.request;
+    NSString *actionId = response.actionIdentifier;
 
-    // 1. Cho Zalo xử lý chuyển tiếp vào đúng phòng chat hoặc luồng xem tin nhắn bình thường
+    // Cho Zalo xử lý chuyển vào phòng chat bình thường
     if (orig_didReceive) {
         orig_didReceive(self, _cmd, center, response, completionHandler);
     } else if (completionHandler) {
         completionHandler();
     }
 
-    // 2. Khi người dùng bấm vào noti trên lockscreen để xem tin nhắn,
-    // SpringBoard / iOS mặc định sẽ xóa (dismiss) notification khỏi Lockscreen.
-    // Để giữ lại trên Lockscreen cho đến khi người dùng tự tay xóa:
-    // Clone nội dung notification và tái tạo lại bằng Local Trigger tức thì.
+    // Nếu người dùng chủ động vuốt xóa thông báo (Dismiss Action), thì để hệ thống xóa, KHÔNG ghim lại!
+    if ([actionId isEqualToString:UNNotificationDismissActionIdentifier]) {
+        NSLog(@"[ZaloKeepNotif] User manually dismissed notification. Not reposting.");
+        return;
+    }
+
+    // Khi người dùng bấm vào xem thông báo (Default Action): SpringBoard tự xóa noti gốc khỏi Lockscreen.
+    // Ta clone nội dung notification và ghim lại lên Lockscreen ngay lập tức:
     if (req && req.content) {
         UNMutableNotificationContent *mc = [req.content mutableCopy];
-        mc.sound = nil; // Không phát lại âm thanh, tránh làm phiền khi đang đọc
+        mc.sound = nil; // Tắt âm thanh để không kêu hay rung lại khi đang xem
+        mc.attachments = @[]; // Xóa attachments tạm thời để tránh lỗi UNErrorDomain Code 100 nếu file ảnh temp bị iOS dọn dẹp
 
-        // Giữ nguyên identifier gốc kèm hậu tố timestamp để tránh trùng lặp id
-        NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-        NSString *keptId = [NSString stringWithFormat:@"%@_kept_%.0f", req.identifier, now];
+        // Đặt ID mới duy nhất
+        NSString *baseId = req.identifier;
+        if ([baseId containsString:@"_kept_"]) {
+            NSArray *parts = [baseId componentsSeparatedByString:@"_kept_"];
+            baseId = parts.firstObject;
+        }
+        NSString *keptId = [NSString stringWithFormat:@"%@_kept_%llu", baseId, (unsigned long long)[[NSDate date] timeIntervalSince1970]];
 
-        // Trigger sau 0.5s - 1.0s để đảm bảo SpringBoard hoàn tất việc xoá noti cũ trước khi noti mới được ghim lên
-        UNTimeIntervalNotificationTrigger *trigger = [UNTimeIntervalNotificationTrigger triggerWithTimeInterval:1.0 repeats:NO];
+        // Không dùng timer trễ (trigger = nil để post ngay lập tức)
         UNNotificationRequest *keptReq = [UNNotificationRequest requestWithIdentifier:keptId
                                                                               content:mc
-                                                                              trigger:trigger];
+                                                                              trigger:nil];
 
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        // Trễ 0.6s để SpringBoard hoàn tất việc đóng view noti gốc trước khi nạp noti ghim lại
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             [[UNUserNotificationCenter currentNotificationCenter] addNotificationRequest:keptReq withCompletionHandler:^(NSError * _Nullable error) {
                 if (!error) {
-                    NSLog(@"[ZaloKeepNotif] Successfully re-pinned notification to Lockscreen: %@", keptId);
+                    NSLog(@"[ZaloKeepNotif] Successfully re-pinned notification: %@", keptId);
                 } else {
                     NSLog(@"[ZaloKeepNotif] Failed to re-pin notification: %@", error);
                 }
@@ -155,12 +163,17 @@ static void swiz_didReceive(id self, SEL _cmd, UNUserNotificationCenter *center,
 
 static void hookDelegate(Class delClass) {
     if (!delClass) return;
+    static Class sHookedClass = Nil;
+    if (sHookedClass == delClass) return;
+    sHookedClass = delClass;
 
     SEL wpSel = @selector(userNotificationCenter:willPresentNotification:withCompletionHandler:);
     Method mWP = class_getInstanceMethod(delClass, wpSel);
     if (mWP) {
         orig_willPresent = (void (*)(id, SEL, UNUserNotificationCenter *, UNNotification *, void (^)(UNNotificationPresentationOptions)))method_getImplementation(mWP);
         method_setImplementation(mWP, (IMP)swiz_willPresent);
+    } else {
+        class_addMethod(delClass, wpSel, (IMP)swiz_willPresent, "v@:@@@?");
     }
 
     SEL drSel = @selector(userNotificationCenter:didReceiveNotificationResponse:withCompletionHandler:);
@@ -168,6 +181,8 @@ static void hookDelegate(Class delClass) {
     if (mDR) {
         orig_didReceive = (void (*)(id, SEL, UNUserNotificationCenter *, UNNotificationResponse *, void (^)(void)))method_getImplementation(mDR);
         method_setImplementation(mDR, (IMP)swiz_didReceive);
+    } else {
+        class_addMethod(delClass, drSel, (IMP)swiz_didReceive, "v@:@@@?");
     }
 }
 
@@ -183,7 +198,7 @@ static void swiz_setDelegate(id self, SEL _cmd, id<UNUserNotificationCenterDeleg
 // ==========================================
 __attribute__((constructor)) static void initZaloKeepNotif() {
     @autoreleasepool {
-        NSLog(@"[ZaloKeepNotif] Initializing clean persistent notification tweak...");
+        NSLog(@"[ZaloKeepNotif] Initializing persistent notification tweak...");
 
         Class uncClass = objc_getClass("UNUserNotificationCenter");
         if (uncClass) {
