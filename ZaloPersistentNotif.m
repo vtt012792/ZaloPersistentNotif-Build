@@ -18,12 +18,12 @@ static void SwizzleInstanceMethod(Class cls, SEL origSel, SEL swizSel) {
 @implementation UNUserNotificationCenter (ZaloKeepNotif)
 
 - (void)zk_removeAllDeliveredNotifications {
-    // Intercept and do nothing: prevents Zalo from clearing delivered notifications on launch/resume
+    // Chặn xoá toàn bộ thông báo đang hiển thị
     NSLog(@"[ZaloKeepNotif] Blocked removeAllDeliveredNotifications");
 }
 
 - (void)zk_removeDeliveredNotificationsWithIdentifiers:(NSArray<NSString *> *)identifiers {
-    // Intercept automatic batch removal when opening conversations
+    // Chặn xoá thông báo theo id khi mở cuộc trò chuyện
     NSLog(@"[ZaloKeepNotif] Blocked removeDeliveredNotificationsWithIdentifiers: count=%lu", (unsigned long)identifiers.count);
 }
 
@@ -35,14 +35,11 @@ static void SwizzleInstanceMethod(Class cls, SEL origSel, SEL swizSel) {
 @implementation UIApplication (ZaloKeepNotif)
 
 - (void)zk_setApplicationIconBadgeNumber:(NSInteger)badgeNumber {
-    // In older iOS versions, setting badge to 0 clears Notification Center notifications.
-    // If badge is 0, we set it to -1 internally or avoid the system call that clears notifications if needed.
-    // Actually, calling original with -1 or keeping badge without clearing delivered notifs:
-    if (badgeNumber == 0) {
-        NSLog(@"[ZaloKeepNotif] Blocked setApplicationIconBadgeNumber:0 to preserve Notification Center");
-        // We can pass -1 or call original with 0 only if it doesn't clear, but on iOS 0 clears NC.
-        // Let's pass -1 or suppress:
-        [self zk_setApplicationIconBadgeNumber:-1];
+    // Trên iOS, gọi setApplicationIconBadgeNumber: 0 sẽ tự động clear sạch Trung tâm thông báo.
+    // Nếu badgeNumber == 0, ta bỏ qua không gọi hàm gốc để không bị mất thông báo trên lockscreen.
+    // Tuyệt đối không truyền số âm (-1) vì SpringBoard sẽ báo lỗi.
+    if (badgeNumber <= 0) {
+        NSLog(@"[ZaloKeepNotif] Suppressed setApplicationIconBadgeNumber:%ld to prevent lockscreen clear", (long)badgeNumber);
         return;
     }
     [self zk_setApplicationIconBadgeNumber:badgeNumber];
@@ -50,11 +47,44 @@ static void SwizzleInstanceMethod(Class cls, SEL origSel, SEL swizSel) {
 
 @end
 
+// Hook delegate để đảm bảo tin nhắn nhóm và tin nhắn mới luôn hiển thị banner + danh sách
+static void (*orig_setDelegate)(id, SEL, id<UNUserNotificationCenterDelegate>);
+static void (*orig_willPresent)(id, SEL, UNUserNotificationCenter *, UNNotification *, void (^)(UNNotificationPresentationOptions));
+
+static void swiz_willPresent(id self, SEL _cmd, UNUserNotificationCenter *center, UNNotification *notification, void (^completionHandler)(UNNotificationPresentationOptions)) {
+    // Đảm bảo thông báo (cả tin nhắn 1-1 và tin nhóm) luôn được hiện banner, âm thanh và lưu vào Notification List
+    UNNotificationPresentationOptions options = UNNotificationPresentationOptionBanner | 
+                                               UNNotificationPresentationOptionSound | 
+                                               UNNotificationPresentationOptionBadge | 
+                                               UNNotificationPresentationOptionList;
+    if (completionHandler) {
+        completionHandler(options);
+    }
+}
+
+static void hookDelegateClass(Class delClass) {
+    if (!delClass) return;
+    SEL willPresentSel = @selector(userNotificationCenter:willPresentNotification:withCompletionHandler:);
+    Method m = class_getInstanceMethod(delClass, willPresentSel);
+    if (m) {
+        orig_willPresent = (void (*)(id, SEL, UNUserNotificationCenter *, UNNotification *, void (^)(UNNotificationPresentationOptions)))method_getImplementation(m);
+        method_setImplementation(m, (IMP)swiz_willPresent);
+        NSLog(@"[ZaloKeepNotif] Hooked willPresentNotification on delegate: %@", NSStringFromClass(delClass));
+    }
+}
+
+static void swiz_setDelegate(id self, SEL _cmd, id<UNUserNotificationCenterDelegate> delegate) {
+    orig_setDelegate(self, _cmd, delegate);
+    if (delegate) {
+        hookDelegateClass([delegate class]);
+    }
+}
+
 __attribute__((constructor)) static void initZaloKeepNotif() {
     @autoreleasepool {
-        NSLog(@"[ZaloKeepNotif] Loaded into process: %@", [[NSProcessInfo processInfo] processName]);
+        NSLog(@"[ZaloKeepNotif] Initializing for Zalo...");
 
-        // Hook UNUserNotificationCenter
+        // 1. Hook UNUserNotificationCenter methods
         Class uncClass = objc_getClass("UNUserNotificationCenter");
         if (uncClass) {
             SwizzleInstanceMethod(uncClass,
@@ -63,10 +93,24 @@ __attribute__((constructor)) static void initZaloKeepNotif() {
             SwizzleInstanceMethod(uncClass,
                                   @selector(removeDeliveredNotificationsWithIdentifiers:),
                                   @selector(zk_removeDeliveredNotificationsWithIdentifiers:));
+
+            // Hook setDelegate: to catch Zalo's notification delegate
+            Method setDelMethod = class_getInstanceMethod(uncClass, @selector(setDelegate:));
+            if (setDelMethod) {
+                orig_setDelegate = (void (*)(id, SEL, id<UNUserNotificationCenterDelegate>))method_getImplementation(setDelMethod);
+                method_setImplementation(setDelMethod, (IMP)swiz_setDelegate);
+            }
+
+            // If delegate already assigned
+            UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
+            if (center.delegate) {
+                hookDelegateClass([center.delegate class]);
+            }
+
             NSLog(@"[ZaloKeepNotif] Successfully hooked UNUserNotificationCenter");
         }
 
-        // Hook UIApplication badge clearing
+        // 2. Hook UIApplication badge number
         Class appClass = objc_getClass("UIApplication");
         if (appClass) {
             SwizzleInstanceMethod(appClass,
