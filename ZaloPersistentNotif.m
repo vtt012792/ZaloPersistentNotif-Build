@@ -230,19 +230,6 @@ static void EnsureSettingsWindow(void) {
 // ==========================================
 // 1. CHẶN XÓA THÔNG BÁO TỪ UNUserNotificationCenter
 // ==========================================
-static void (*orig_removeDeliveredWithIds)(id, SEL, NSArray<NSString *> *) = NULL;
-static BOOL sAllowInternalRemove = NO;
-
-static void swiz_removeDeliveredWithIds(id self, SEL _cmd, NSArray<NSString *> *identifiers) {
-    if (sAllowInternalRemove) {
-        if (orig_removeDeliveredWithIds) {
-            orig_removeDeliveredWithIds(self, _cmd, identifiers);
-        }
-        return;
-    }
-    NSLog(@"[ZaloKeepNotif] Blocked external removeDeliveredNotificationsWithIdentifiers: count=%lu", (unsigned long)identifiers.count);
-}
-
 @interface UNUserNotificationCenter (ZaloKeepNotif)
 @end
 
@@ -250,6 +237,10 @@ static void swiz_removeDeliveredWithIds(id self, SEL _cmd, NSArray<NSString *> *
 
 - (void)zk_removeAllDeliveredNotifications {
     NSLog(@"[ZaloKeepNotif] Blocked removeAllDeliveredNotifications");
+}
+
+- (void)zk_removeDeliveredNotificationsWithIdentifiers:(NSArray<NSString *> *)identifiers {
+    NSLog(@"[ZaloKeepNotif] Blocked removeDeliveredNotificationsWithIdentifiers: count=%lu", (unsigned long)identifiers.count);
 }
 
 - (void)zk_removeAllPendingNotificationRequests {
@@ -267,6 +258,16 @@ static void swiz_removeDeliveredWithIds(id self, SEL _cmd, NSArray<NSString *> *
         return;
     }
     [self zk_setBadgeCount:newBadgeCount withCompletionHandler:completionHandler];
+}
+
+// Can thiệp addNotificationRequest để tiêm cờ shouldPreventNotificationDismissalAfterDefaultAction
+- (void)zk_addNotificationRequest:(UNNotificationRequest *)request withCompletionHandler:(void(^)(NSError *error))completionHandler {
+    if (request && request.content) {
+        @try {
+            [request.content setValue:@YES forKey:@"shouldPreventNotificationDismissalAfterDefaultAction"];
+        } @catch (NSException *e) {}
+    }
+    [self zk_addNotificationRequest:request withCompletionHandler:completionHandler];
 }
 
 @end
@@ -290,16 +291,24 @@ static void swiz_removeDeliveredWithIds(id self, SEL _cmd, NSArray<NSString *> *
 @end
 
 // ==========================================
-// 3. TẠO BẢN SAO CONTENT HOÀN HẢO (KHÔNG BANNER / KHÔNG SOUND)
+// 3. TẠO BẢN SAO CONTENT HOÀN HẢO (GIỮ NGUYÊN DATE GỐC & KHÔNG POPUP)
 // ==========================================
-static UNMutableNotificationContent *zk_prepareContentCopy(UNNotificationContent *origContent) {
+static UNMutableNotificationContent *zk_prepareContentCopy(UNNotificationContent *origContent, NSDate *originalDate) {
     UNMutableNotificationContent *mc = [origContent mutableCopy];
     mc.sound = nil; // Tắt âm thanh để không rung/chuông khi khôi phục
     mc.attachments = @[]; // Tránh lỗi file temp attachments
 
-    // Chống sáng màn hình và chống bung popup
+    // Cờ chống sáng màn hình và chống bung popup
     @try { [mc setValue:@YES forKey:@"shouldSuppressScreenLightUp"]; } @catch (NSException *e) {}
     @try { [mc setValue:@YES forKey:@"shouldSuppressDefaultAction"]; } @catch (NSException *e) {}
+
+    // CỜ CỐT LÕI CỦA APPLE: Ngăn SpringBoard xóa thông báo sau khi click!
+    @try { [mc setValue:@YES forKey:@"shouldPreventNotificationDismissalAfterDefaultAction"]; } @catch (NSException *e) {}
+
+    // BẢO TỒN THỜI GIAN GỐC HIỂN THỊ TRÊN LOCKSCREEN
+    if (originalDate) {
+        @try { [mc setValue:originalDate forKey:@"date"]; } @catch (NSException *e) {}
+    }
 
     NSInteger mode = [[NSUserDefaults standardUserDefaults] integerForKey:kPrefGroupModeKey];
 
@@ -329,37 +338,16 @@ static UNMutableNotificationContent *zk_prepareContentCopy(UNNotificationContent
     // Đánh dấu cờ nội bộ để willPresentNotification nhận diện và dập tắt hoàn toàn popup
     NSMutableDictionary *u = [mc.userInfo mutableCopy] ?: [NSMutableDictionary dictionary];
     u[@"zk_kept"] = @YES;
+    if (originalDate) {
+        u[@"zk_orig_date"] = originalDate;
+    }
     mc.userInfo = u;
 
     return mc;
 }
 
 // ==========================================
-// 4. CASCADE MONOTONIC RE-ORDERING ENGINE (30ms tuần tự)
-// ==========================================
-static void zk_sequentialRepost(NSArray<UNNotificationRequest *> *queue, NSUInteger index, void (^onComplete)(void)) {
-    if (index >= queue.count) {
-        if (onComplete) onComplete();
-        return;
-    }
-
-    UNNotificationRequest *req = queue[index];
-    [[UNUserNotificationCenter currentNotificationCenter] addNotificationRequest:req withCompletionHandler:^(NSError * _Nullable error) {
-        if (error) {
-            NSLog(@"[ZaloKeepNotif] Error reposting request [%lu/%lu] id=%@: %@", (unsigned long)index, (unsigned long)queue.count, req.identifier, error);
-        } else {
-            NSLog(@"[ZaloKeepNotif] Successfully reposted request [%lu/%lu] id=%@", (unsigned long)index, (unsigned long)queue.count, req.identifier);
-        }
-
-        // Delay 30ms giữa mỗi thông báo để usernoted ghi nhận SQLite timestamp tăng dần rõ rệt
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.030 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            zk_sequentialRepost(queue, index + 1, onComplete);
-        });
-    }];
-}
-
-// ==========================================
-// 5. HOOK DELEGATE CỦA UNUserNotificationCenter
+// 4. HOOK DELEGATE CỦA UNUserNotificationCenter
 // ==========================================
 static void (*orig_setDelegate)(id, SEL, id<UNUserNotificationCenterDelegate>) = NULL;
 static void (*orig_willPresent)(id, SEL, UNUserNotificationCenter *, UNNotification *, void (^)(UNNotificationPresentationOptions)) = NULL;
@@ -368,6 +356,11 @@ static BOOL (*orig_respondsToSelector)(id, SEL, SEL) = NULL;
 
 static void swiz_willPresent(id self, SEL _cmd, UNUserNotificationCenter *center, UNNotification *notification, void (^completionHandler)(UNNotificationPresentationOptions)) {
     NSDictionary *userInfo = notification.request.content.userInfo;
+
+    // Đảm bảo thông báo mới đến cũng mang cờ chống bị xóa khi click
+    @try {
+        [notification.request.content setValue:@YES forKey:@"shouldPreventNotificationDismissalAfterDefaultAction"];
+    } @catch (NSException *e) {}
 
     // Chặn triệt để popup banner khi thông báo được dylib ghim lại
     if (userInfo && userInfo[@"zk_kept"]) {
@@ -410,65 +403,30 @@ static void swiz_didReceive(id self, SEL _cmd, UNUserNotificationCenter *center,
     UNNotificationRequest *tappedReq = tappedNotif.request;
     if (!tappedReq || !tappedReq.content) return;
 
-    NSDate *tappedDate = tappedNotif.date ?: [NSDate dateWithTimeIntervalSinceNow:-60];
+    // LẤY CHÍNH XÁC MỐC THỜI GIAN GỐC CỦA TIN NHẮN
+    NSDate *origDate = tappedNotif.date;
+    if (!origDate && tappedReq.content.userInfo && tappedReq.content.userInfo[@"zk_orig_date"]) {
+        origDate = tappedReq.content.userInfo[@"zk_orig_date"];
+    }
+    if (!origDate) {
+        origDate = [NSDate date];
+    }
 
-    // 3. Lấy danh sách toàn bộ thông báo đang có trên Lockscreen để tính toán thứ tự tương đối
-    [[UNUserNotificationCenter currentNotificationCenter] getDeliveredNotificationsWithCompletionHandler:^(NSArray<UNNotification *> * _Nonnull deliveredList) {
-        NSMutableArray<UNNotification *> *newerNotifications = [NSMutableArray array];
-        NSMutableArray<NSString *> *newerIdentifiers = [NSMutableArray array];
+    // TẠO LẠI ĐÚNG DUY NHẤT THÔNG BÁO VỪA CLICK (VỚI MỐC THỜI GIAN GỐC & CỜ CHỐNG XÓA)
+    // TUYỆT ĐỐI KHÔNG XÓA/NẠP LẠI CÁC THÔNG BÁO KHÁC ĐỂ TRÁNH LÀM ĐỔI THỜI GIAN VÀ THỨ TỰ TRÊN MÀN HÌNH KHÓA
+    UNMutableNotificationContent *repostContent = zk_prepareContentCopy(tappedReq.content, origDate);
+    UNNotificationRequest *repostReq = [UNNotificationRequest requestWithIdentifier:tappedReq.identifier
+                                                                            content:repostContent
+                                                                            trigger:nil];
 
-        for (UNNotification *n in deliveredList) {
-            // Lọc ra các thông báo vốn dĩ đến SAU thông báo vừa click
-            if ([n.date compare:tappedDate] == NSOrderedDescending) {
-                [newerNotifications addObject:n];
-                if (n.request.identifier) {
-                    [newerIdentifiers addObject:n.request.identifier];
-                }
-            }
+    NSLog(@"[ZaloKeepNotif] Restoring single tapped notification with preserved date=%@, id=%@", origDate, tappedReq.identifier);
+
+    [[UNUserNotificationCenter currentNotificationCenter] addNotificationRequest:repostReq withCompletionHandler:^(NSError * _Nullable error) {
+        if (error) {
+            NSLog(@"[ZaloKeepNotif] Error restoring tapped request id=%@: %@", tappedReq.identifier, error);
+        } else {
+            NSLog(@"[ZaloKeepNotif] Successfully restored tapped request id=%@ with original date", tappedReq.identifier);
         }
-
-        // Sắp xếp các thông báo mới hơn theo thứ tự TĂNG DẦN (từ cũ đến mới)
-        [newerNotifications sortUsingComparator:^NSComparisonResult(UNNotification *n1, UNNotification *n2) {
-            return [n1.date compare:n2.date];
-        }];
-
-        // Xây dựng hàng đợi nạp tuần tự đơn điệu:
-        // [0]: Thông báo vừa click (nhận mốc t0)
-        // [1...m]: Các thông báo mới hơn lần lượt nhận t1 < t2 < ... < tm
-        NSMutableArray<UNNotificationRequest *> *repostQueue = [NSMutableArray array];
-
-        // A. Thêm thông báo vừa bấm vào hàng đợi đầu tiên
-        UNMutableNotificationContent *tappedContent = zk_prepareContentCopy(tappedReq.content);
-        UNNotificationRequest *repostTappedReq = [UNNotificationRequest requestWithIdentifier:tappedReq.identifier
-                                                                                      content:tappedContent
-                                                                                      trigger:nil];
-        [repostQueue addObject:repostTappedReq];
-
-        // B. Thêm các thông báo mới hơn vào sau để đảm bảo chúng luôn nằm TRÊN thông báo vừa bấm
-        for (UNNotification *n in newerNotifications) {
-            UNMutableNotificationContent *newerContent = zk_prepareContentCopy(n.request.content);
-            UNNotificationRequest *req = [UNNotificationRequest requestWithIdentifier:n.request.identifier
-                                                                              content:newerContent
-                                                                              trigger:nil];
-            [repostQueue addObject:req];
-        }
-
-        NSLog(@"[ZaloKeepNotif] Executing Cascading Monotonic Re-order. Total items: %lu, newer to purge: %lu", (unsigned long)repostQueue.count, (unsigned long)newerIdentifiers.count);
-
-        // QUAN TRỌNG NHẤT:
-        // Xóa các thông báo mới hơn khỏi usernoted trước, sau đó nạp lại tuần tự để usernoted gán timestamp mới tuyệt đối
-        if (newerIdentifiers.count > 0 && orig_removeDeliveredWithIds) {
-            sAllowInternalRemove = YES;
-            orig_removeDeliveredWithIds([UNUserNotificationCenter currentNotificationCenter], @selector(removeDeliveredNotificationsWithIdentifiers:), newerIdentifiers);
-            sAllowInternalRemove = NO;
-        }
-
-        // Chạy quy trình nạp tuần tự trên main queue sau 0.08s
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.08 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            zk_sequentialRepost(repostQueue, 0, ^{
-                NSLog(@"[ZaloKeepNotif] Cascading Monotonic Re-order finished. Lockscreen order preserved perfectly!");
-            });
-        });
     }];
 }
 
@@ -528,11 +486,11 @@ static void swiz_setDelegate(id self, SEL _cmd, id<UNUserNotificationCenterDeleg
 }
 
 // ==========================================
-// 6. CONSTRUCTOR
+// 5. CONSTRUCTOR
 // ==========================================
 __attribute__((constructor)) static void initZaloKeepNotif() {
     @autoreleasepool {
-        NSLog(@"[ZaloKeepNotif] Initializing v13 tweak (Purge-and-Cascade Engine + Fixed Overlay Button)...");
+        NSLog(@"[ZaloKeepNotif] Initializing v14 tweak (Native shouldPreventNotificationDismissal + Preserved Original Date)...");
 
         // Hook UIViewController viewDidAppear để gắn nút cố định ngay trên màn hình khóa Zalo
         Class vcClass = objc_getClass("UIViewController");
@@ -567,19 +525,20 @@ __attribute__((constructor)) static void initZaloKeepNotif() {
             SwizzleMethod(uncClass,
                           @selector(removeAllDeliveredNotifications),
                           @selector(zk_removeAllDeliveredNotifications));
-
-            Method remMethod = class_getInstanceMethod(uncClass, @selector(removeDeliveredNotificationsWithIdentifiers:));
-            if (remMethod) {
-                orig_removeDeliveredWithIds = (void (*)(id, SEL, NSArray<NSString *> *))method_getImplementation(remMethod);
-                method_setImplementation(remMethod, (IMP)swiz_removeDeliveredWithIds);
-            }
-
+            SwizzleMethod(uncClass,
+                          @selector(removeDeliveredNotificationsWithIdentifiers:),
+                          @selector(zk_removeDeliveredNotificationsWithIdentifiers:));
             SwizzleMethod(uncClass,
                           @selector(removeAllPendingNotificationRequests),
                           @selector(zk_removeAllPendingNotificationRequests));
             SwizzleMethod(uncClass,
                           @selector(removePendingNotificationRequestsWithIdentifiers:),
                           @selector(zk_removePendingNotificationRequestsWithIdentifiers:));
+
+            // Hook addNotificationRequest để tiêm cờ shouldPreventNotificationDismissalAfterDefaultAction
+            SwizzleMethod(uncClass,
+                          @selector(addNotificationRequest:withCompletionHandler:),
+                          @selector(zk_addNotificationRequest:withCompletionHandler:));
 
             SEL setBadgeSel = @selector(setBadgeCount:withCompletionHandler:);
             if (class_getInstanceMethod(uncClass, setBadgeSel)) {
