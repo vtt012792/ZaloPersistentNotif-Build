@@ -160,7 +160,10 @@ static void EnsureSettingsWindow(void) {
             }
         }
 
-        CGRect btnFrame = CGRectMake(screenBounds.size.width - 54, topInset, 44, 44);
+        CGFloat btnW = 44.0;
+        CGFloat btnH = 44.0;
+        CGFloat btnX = (screenBounds.size.width - btnW) / 2.0; // Căn giữa chính xác bên trên màn hình Zalo
+        CGRect btnFrame = CGRectMake(btnX, topInset, btnW, btnH);
 
         if (!sSettingsWindow) {
             if (@available(iOS 13.0, *)) {
