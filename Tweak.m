@@ -3,19 +3,41 @@
 #import <objc/runtime.h>
 #import <os/log.h>
 #import <dlfcn.h>
+#import <mach/mach_time.h>
 
 // ==========================================
-// ZaloKeepNotif — Giai đoạn 0 (Phase 0: Probe)
+// ZaloKeepNotif — Phase 1: Pure Persistence
 // Thiết bị đích: iPhone iOS 16.5 (Dopamine roothide, arm64e)
-// Hook: com.apple.springboard
-// Mục đích: CHỈ GHI LOG chi tiết, KHÔNG CHẶN, để xác định:
-//   1. Khóa dữ liệu trong push payload của Zalo (id, conv_id, grid, uid...)
-//   2. Nguồn gọi và callstack khi thông báo bị rút/xóa
-//   3. Sự kiện bấm (default action), vuốt xóa (dismiss), xóa cụm
-//   4. Sự kiện cập nhật badge
+// Filter: com.apple.springboard
+// Mục tiêu:
+//   1. Thông báo Zalo không bao giờ mất khi nhấn vào (tap opens Zalo, notif stays).
+//   2. Giữ nguyên vị trí và mốc thời gian gốc (không xóa, không đăng lại, không đổi giờ).
+//   3. Chặn triệt để mọi lệnh rút/xóa từ Zalo app, usernoted, push thu hồi, web.
+//   4. CHỈ XÓA KHI NGƯỜI DÙNG CHỦ ĐỘNG XÓA (vuốt xóa hoặc bấm nút "Xóa tất cả").
+//   5. Thông báo mới gộp/thay thế sẽ được giữ cả cũ lẫn mới như thông báo độc lập.
 // ==========================================
 
 static NSString *const kZaloSectionID = @"com.vng.zalo";
+
+// Trạng thái thread-local đánh dấu hành động do người dùng chủ động xóa
+static __thread BOOL t_isUserClearing = NO;
+
+// Trạng thái thread-local đánh dấu đang thực thi action bấm mở app Zalo
+static __thread BOOL t_isExecutingZaloAction = NO;
+
+// Danh sách lưu các notificationIdentifier do người dùng chủ động vuốt xóa
+static NSMutableSet<NSString *> *sUserDismissedNotificationIDs = nil;
+
+// Danh sách theo dõi các notificationIdentifier Zalo đang tồn tại để giữ cả cũ lẫn mới
+static NSMutableSet<NSString *> *sActiveZaloNotificationIDs = nil;
+
+static inline void ZKInitSets(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        sUserDismissedNotificationIDs = [[NSMutableSet alloc] init];
+        sActiveZaloNotificationIDs = [[NSMutableSet alloc] init];
+    });
+}
 
 // ==========================================
 // ROOTHIDE LOG PATH RESOLVER
@@ -24,7 +46,6 @@ static NSString *ZKGetLogPath(void) {
     static NSString *sCachedLogPath = nil;
     if (sCachedLogPath) return sCachedLogPath;
 
-    // 1. Thử hàm jbroot() từ libroothide nếu có
     typedef const char *(*jbroot_c_func)(const char *);
     jbroot_c_func jbroot_fn = (jbroot_c_func)dlsym(RTLD_DEFAULT, "jbroot");
     if (jbroot_fn) {
@@ -35,7 +56,6 @@ static NSString *ZKGetLogPath(void) {
         }
     }
 
-    // 2. Mặc định ghi vào /var/mobile/Library/Logs/ZaloKeepNotif.log
     sCachedLogPath = @"/var/mobile/Library/Logs/ZaloKeepNotif.log";
     return sCachedLogPath;
 }
@@ -49,7 +69,6 @@ static void ZKLog(NSString *category, NSString *format, ...) {
     NSString *body = [[NSString alloc] initWithFormat:format arguments:args];
     va_end(args);
 
-    // 1. os_log (xem bằng Console.app hoặc oslog)
     static os_log_t sOSLog = nil;
     static dispatch_once_t onceOS;
     dispatch_once(&onceOS, ^{
@@ -57,7 +76,6 @@ static void ZKLog(NSString *category, NSString *format, ...) {
     });
     os_log(sOSLog, "[%{public}@] %{public}@", category, body);
 
-    // 2. File log (xem bằng Filza / chép về máy tính)
     static dispatch_queue_t sLogQueue = nil;
     static dispatch_once_t onceQueue;
     dispatch_once(&onceQueue, ^{
@@ -113,65 +131,63 @@ static void SwizzleInstanceMethod(Class cls, SEL origSel, SEL swizSel) {
 }
 
 // ==========================================
-// DUMP HELPER FOR NCNotificationRequest
+// 1. HOOK NCNotificationAction
+// Chặn SpringBoard tự đóng thông báo khi bấm mở app
 // ==========================================
-static NSString *ZKDumpRequest(id req) {
-    if (!req) return @"(nil request)";
-    NSMutableString *outStr = [NSMutableString string];
+@interface ZKHook_NCNotificationAction : NSObject
+@end
 
-    @try {
-        NSString *secId = [req valueForKey:@"sectionIdentifier"];
-        NSString *notifId = [req valueForKey:@"notificationIdentifier"];
-        NSString *threadId = [req valueForKey:@"threadIdentifier"];
-        NSString *catId = [req valueForKey:@"categoryIdentifier"];
-        NSDate *timestamp = [req valueForKey:@"timestamp"];
+@implementation ZKHook_NCNotificationAction
 
-        [outStr appendFormat:@"secId=%@ | notifId=%@ | threadId=%@ | catId=%@ | time=%@",
-         secId, notifId, threadId, catId, timestamp];
-
-        id content = [req valueForKey:@"content"];
-        if (content) {
-            NSString *title = [content valueForKey:@"title"];
-            NSString *subtitle = [content valueForKey:@"subtitle"];
-            NSString *message = [content valueForKey:@"message"] ?: [content valueForKey:@"body"];
-            NSString *header = [content valueForKey:@"header"];
-            [outStr appendFormat:@"\n    [Content] header='%@' | title='%@' | sub='%@' | msg='%@'",
-             header ?: @"", title ?: @"", subtitle ?: @"", message ?: @""];
-        }
-
-        id userNotif = [req valueForKey:@"userNotification"];
-        if (userNotif) {
-            id reqInner = [userNotif valueForKey:@"request"];
-            id contentInner = [reqInner valueForKey:@"content"];
-            NSDictionary *userInfo = [contentInner valueForKey:@"userInfo"];
-            if (userInfo) {
-                [outStr appendFormat:@"\n    [UserInfo Keys] %@", [userInfo allKeys]];
-                [outStr appendFormat:@"\n    [UserInfo Dump] %@", userInfo];
-            }
-        }
-
-        id context = [req valueForKey:@"context"];
-        if (context) {
-            [outStr appendFormat:@"\n    [Context] %@", context];
-        }
-    } @catch (NSException *e) {
-        [outStr appendFormat:@"\n    [Exception dumping request: %@]", e];
+- (BOOL)zk_shouldDismissNotification {
+    if (t_isExecutingZaloAction) {
+        ZKLog(@"ACTION", @"Forced shouldDismissNotification = NO during Zalo action execution.");
+        return NO;
     }
 
-    return outStr;
+    NSString *bundle = nil;
+    @try { bundle = [self valueForKey:@"launchBundleID"]; } @catch (NSException *e) {}
+    if ([bundle isEqualToString:kZaloSectionID]) {
+        ZKLog(@"ACTION", @"Forced shouldDismissNotification = NO for Zalo launchBundleID.");
+        return NO;
+    }
+
+    return [self zk_shouldDismissNotification];
 }
 
-// Lấy 6 khung stack trace đầu tiên (bỏ qua frame nội bộ) để xác định thủ phạm gọi
-static NSString *ZKGetCallerTrace(void) {
-    NSArray *symbols = [NSThread callStackSymbols];
-    NSUInteger count = MIN((NSUInteger)8, symbols.count);
-    NSArray *sub = [symbols subarrayWithRange:NSMakeRange(1, count - 1)];
-    return [sub componentsJoinedByString:@"\n      "];
-}
+@end
 
 // ==========================================
-// 1. HOOK NCNotificationDispatcher
-// (Trung tâm điều phối thông báo trong UserNotificationsKit)
+// 2. HOOK NCNotificationOptions
+// Giữ thông báo luôn nằm trên Lockscreen và không bao giờ tự đóng
+// ==========================================
+@interface ZKHook_NCNotificationOptions : NSObject
+@end
+
+@implementation ZKHook_NCNotificationOptions
+
+- (BOOL)zk_dismissAutomatically {
+    id isZalo = objc_getAssociatedObject(self, "kIsZaloOptions");
+    if ([isZalo boolValue]) {
+        return NO;
+    }
+    return [self zk_dismissAutomatically];
+}
+
+- (unsigned long long)zk_lockScreenPersistence {
+    id isZalo = objc_getAssociatedObject(self, "kIsZaloOptions");
+    if ([isZalo boolValue]) {
+        // 1 = Persistent (luôn giữ trên màn hình khóa)
+        return 1;
+    }
+    return [self zk_lockScreenPersistence];
+}
+
+@end
+
+// ==========================================
+// 3. HOOK NCNotificationDispatcher
+// Trung tâm điều phối hiển thị và thu hồi thông báo trong SpringBoard
 // ==========================================
 @interface ZKHook_NCNotificationDispatcher : NSObject
 @end
@@ -180,150 +196,262 @@ static NSString *ZKGetCallerTrace(void) {
 
 // A. Thông báo mới tới
 - (void)zk_postNotificationWithRequest:(id)request {
+    ZKInitSets();
     NSString *secId = nil;
     @try { secId = [request valueForKey:@"sectionIdentifier"]; } @catch (NSException *e) {}
 
     if ([secId isEqualToString:kZaloSectionID]) {
-        ZKLog(@"POST_NEW", @"Incoming Zalo Notification:\n  %@\n  [Caller]\n      %@",
-              ZKDumpRequest(request), ZKGetCallerTrace());
+        NSString *notifId = nil;
+        @try { notifId = [request valueForKey:@"notificationIdentifier"]; } @catch (NSException *e) {}
+
+        // Đánh dấu options để không tự dismiss và giữ persistent
+        id options = nil;
+        @try { options = [request valueForKey:@"options"]; } @catch (NSException *e) {}
+        if (options) {
+            objc_setAssociatedObject(options, "kIsZaloOptions", @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            @try { [options setValue:@(NO) forKey:@"dismissAutomatically"]; } @catch (NSException *e) {}
+            @try { [options setValue:@(1) forKey:@"lockScreenPersistence"]; } @catch (NSException *e) {}
+        }
+
+        // Đánh dấu defaultAction không dismiss
+        id defaultAction = nil;
+        @try { defaultAction = [request valueForKey:@"defaultAction"]; } @catch (NSException *e) {}
+        if (defaultAction) {
+            @try { [defaultAction setValue:@(NO) forKey:@"shouldDismissNotification"]; } @catch (NSException *e) {}
+        }
+
+        // Nếu thông báo với ID này đã tồn tại, biến nó thành ID mới độc lập để giữ cả cũ lẫn mới
+        if (notifId) {
+            @synchronized(sActiveZaloNotificationIDs) {
+                if ([sActiveZaloNotificationIDs containsObject:notifId]) {
+                    NSString *uniqueId = [NSString stringWithFormat:@"%@#%llu", notifId, mach_absolute_time()];
+                    @try { [request setValue:uniqueId forKey:@"notificationIdentifier"]; } @catch (NSException *e) {}
+                    ZKLog(@"POST_COLLAPSE", @"Zalo duplicate notifId=%@ -> generated uniqueId=%@ to retain both!", notifId, uniqueId);
+                    notifId = uniqueId;
+                }
+                [sActiveZaloNotificationIDs addObject:notifId];
+            }
+        }
+
+        ZKLog(@"POST_ZALO", @"Posted persistent Zalo notification: notifId=%@", notifId);
     }
 
-    // Gọi hàm gốc (không can thiệp)
     [self zk_postNotificationWithRequest:request];
 }
 
-// B. Thông báo được sửa đổi/thay thế (gộp tin, cập nhật, thu hồi...)
+// B. Thông báo được sửa đổi/thay thế (gộp tin, cập nhật)
 - (void)zk_modifyNotificationWithRequest:(id)request {
+    ZKInitSets();
     NSString *secId = nil;
     @try { secId = [request valueForKey:@"sectionIdentifier"]; } @catch (NSException *e) {}
 
     if ([secId isEqualToString:kZaloSectionID]) {
-        ZKLog(@"MODIFY", @"Modified/Updated Zalo Notification:\n  %@\n  [Caller]\n      %@",
-              ZKDumpRequest(request), ZKGetCallerTrace());
+        // Thay vì ghi đè thông báo cũ làm mất tin cũ hoặc đổi giờ,
+        // ta tạo ID độc lập và post như một thông báo mới toanh!
+        NSString *origId = nil;
+        @try { origId = [request valueForKey:@"notificationIdentifier"]; } @catch (NSException *e) {}
+        NSString *uniqueId = [NSString stringWithFormat:@"%@#mod_%llu", origId ?: @"zalo", mach_absolute_time()];
+        @try { [request setValue:uniqueId forKey:@"notificationIdentifier"]; } @catch (NSException *e) {}
+
+        id options = nil;
+        @try { options = [request valueForKey:@"options"]; } @catch (NSException *e) {}
+        if (options) {
+            objc_setAssociatedObject(options, "kIsZaloOptions", @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            @try { [options setValue:@(NO) forKey:@"dismissAutomatically"]; } @catch (NSException *e) {}
+            @try { [options setValue:@(1) forKey:@"lockScreenPersistence"]; } @catch (NSException *e) {}
+        }
+
+        id defaultAction = nil;
+        @try { defaultAction = [request valueForKey:@"defaultAction"]; } @catch (NSException *e) {}
+        if (defaultAction) {
+            @try { [defaultAction setValue:@(NO) forKey:@"shouldDismissNotification"]; } @catch (NSException *e) {}
+        }
+
+        @synchronized(sActiveZaloNotificationIDs) {
+            [sActiveZaloNotificationIDs addObject:uniqueId];
+        }
+
+        ZKLog(@"MODIFY_CONVERT", @"Converted modifyNotification for Zalo to new post: origId=%@ -> newId=%@", origId, uniqueId);
+        [self zk_postNotificationWithRequest:request];
+        return;
     }
 
     [self zk_modifyNotificationWithRequest:request];
 }
 
-// C. Lệnh rút/xóa thông báo
+// C. LỆNH RÚT/XÓA THÔNG BÁO — CHẶN TRIỆT ĐỂ NẾU KHÔNG PHẢI DO NGƯỜI DÙNG XÓA
 - (void)zk_withdrawNotificationWithRequest:(id)request {
+    ZKInitSets();
     NSString *secId = nil;
     @try { secId = [request valueForKey:@"sectionIdentifier"]; } @catch (NSException *e) {}
 
     if ([secId isEqualToString:kZaloSectionID]) {
-        ZKLog(@"WITHDRAW", @"Withdraw Zalo Notification:\n  %@\n  [Caller]\n      %@",
-              ZKDumpRequest(request), ZKGetCallerTrace());
+        NSString *notifId = nil;
+        @try { notifId = [request valueForKey:@"notificationIdentifier"]; } @catch (NSException *e) {}
+
+        BOOL isExplicitUserDismiss = NO;
+        if (t_isUserClearing) {
+            isExplicitUserDismiss = YES;
+        } else if (notifId) {
+            @synchronized(sUserDismissedNotificationIDs) {
+                if ([sUserDismissedNotificationIDs containsObject:notifId]) {
+                    isExplicitUserDismiss = YES;
+                    [sUserDismissedNotificationIDs removeObject:notifId];
+                }
+            }
+        }
+
+        if (!isExplicitUserDismiss) {
+            // ĐÂY LÀ LỆNH RÚT TỰ ĐỘNG (DO ZALO MỞ, ĐỌC TRÊN WEB, HOẶC IOS BẤM MỞ).
+            // CHẶN HOÀN TOÀN! KHÔNG GỌI HÀM GỐC!
+            ZKLog(@"BLOCK_WITHDRAW", @"[BLOCKED] Suppressed withdrawal of Zalo notification: notifId=%@", notifId);
+            return;
+        }
+
+        // Người dùng tự xóa -> Cho phép xóa và dọn khỏi danh sách theo dõi
+        @synchronized(sActiveZaloNotificationIDs) {
+            if (notifId) [sActiveZaloNotificationIDs removeObject:notifId];
+        }
+        ZKLog(@"USER_WITHDRAW", @"[ALLOWED] Permitted user-initiated withdrawal: notifId=%@", notifId);
     }
 
     [self zk_withdrawNotificationWithRequest:request];
 }
 
-// D. Thực thi Action (Bấm vào thông báo, bấm nút trả lời nhanh, dismiss...)
+// D. Bấm vào thông báo (Default Action)
 - (void)zk_destination:(id)destination executeAction:(id)action forNotificationRequest:(id)request requestAuthentication:(BOOL)auth withParameters:(id)params completion:(id)completion {
     NSString *secId = nil;
     @try { secId = [request valueForKey:@"sectionIdentifier"]; } @catch (NSException *e) {}
 
-    if ([secId isEqualToString:kZaloSectionID]) {
-        NSString *actionId = nil;
-        NSString *actionTitle = nil;
-        @try {
-            actionId = [action valueForKey:@"identifier"];
-            actionTitle = [action valueForKey:@"title"];
-        } @catch (NSException *e) {}
-
-        ZKLog(@"EXEC_ACTION", @"Action on Zalo Notification:\n  actionId='%@' title='%@' dest='%@' auth=%d\n  %@\n  [Caller]\n      %@",
-              actionId, actionTitle, [destination description], auth,
-              ZKDumpRequest(request), ZKGetCallerTrace());
+    BOOL isZalo = [secId isEqualToString:kZaloSectionID];
+    if (isZalo) {
+        t_isExecutingZaloAction = YES;
+        NSString *notifId = nil;
+        @try { notifId = [request valueForKey:@"notificationIdentifier"]; } @catch (NSException *e) {}
+        ZKLog(@"EXEC_TAP", @"User tapped Zalo notification (launching Zalo, keeping notif): notifId=%@", notifId);
     }
 
-    [self zk_destination:destination executeAction:action forNotificationRequest:request requestAuthentication:auth withParameters:params completion:completion];
+    @try {
+        [self zk_destination:destination executeAction:action forNotificationRequest:request requestAuthentication:auth withParameters:params completion:completion];
+    } @finally {
+        if (isZalo) {
+            t_isExecutingZaloAction = NO;
+        }
+    }
 }
 
-// E. Người dùng vuốt xóa một thông báo
+// E. Người dùng vuốt xóa 1 thông báo
 - (void)zk_destination:(id)destination didDismissNotificationRequest:(id)request {
+    ZKInitSets();
     NSString *secId = nil;
     @try { secId = [request valueForKey:@"sectionIdentifier"]; } @catch (NSException *e) {}
 
     if ([secId isEqualToString:kZaloSectionID]) {
-        ZKLog(@"USER_DISMISS", @"User dismissed Zalo notification:\n  dest='%@'\n  %@\n  [Caller]\n      %@",
-              [destination description], ZKDumpRequest(request), ZKGetCallerTrace());
+        NSString *notifId = nil;
+        @try { notifId = [request valueForKey:@"notificationIdentifier"]; } @catch (NSException *e) {}
+        if (notifId) {
+            @synchronized(sUserDismissedNotificationIDs) {
+                [sUserDismissedNotificationIDs addObject:notifId];
+            }
+        }
+        ZKLog(@"USER_SWIPE", @"User swiped to delete Zalo notification: notifId=%@", notifId);
     }
 
-    [self zk_destination:destination didDismissNotificationRequest:request];
+    t_isUserClearing = YES;
+    @try {
+        [self zk_destination:destination didDismissNotificationRequest:request];
+    } @finally {
+        t_isUserClearing = NO;
+    }
 }
 
-// F. Xóa nhiều thông báo cùng lúc (ví dụ nút "Xóa" một nhóm hoặc "Xóa tất cả")
+// F. Người dùng bấm nút "Xóa tất cả" / Xóa một nhóm
 - (void)zk_destination:(id)destination requestsClearingNotificationRequests:(id)requests {
-    BOOL hasZalo = NO;
+    ZKInitSets();
     if ([requests isKindOfClass:[NSArray class]]) {
         for (id req in (NSArray *)requests) {
             NSString *sec = nil;
             @try { sec = [req valueForKey:@"sectionIdentifier"]; } @catch (NSException *e) {}
             if ([sec isEqualToString:kZaloSectionID]) {
-                hasZalo = YES;
-                break;
+                NSString *nid = nil;
+                @try { nid = [req valueForKey:@"notificationIdentifier"]; } @catch (NSException *e) {}
+                if (nid) {
+                    @synchronized(sUserDismissedNotificationIDs) {
+                        [sUserDismissedNotificationIDs addObject:nid];
+                    }
+                }
             }
         }
     }
 
-    if (hasZalo) {
-        ZKLog(@"CLEAR_GROUP", @"Clearing notification requests batch (has Zalo, count=%lu):\n  dest='%@'\n  [Caller]\n      %@",
-              (unsigned long)[(NSArray *)requests count], [destination description], ZKGetCallerTrace());
+    t_isUserClearing = YES;
+    @try {
+        [self zk_destination:destination requestsClearingNotificationRequests:requests];
+    } @finally {
+        t_isUserClearing = NO;
+    }
+}
+
+- (void)zk_destination:(id)destination requestsClearingNotificationRequests:(id)requests fromDestinations:(id)dests {
+    ZKInitSets();
+    if ([requests isKindOfClass:[NSArray class]]) {
+        for (id req in (NSArray *)requests) {
+            NSString *sec = nil;
+            @try { sec = [req valueForKey:@"sectionIdentifier"]; } @catch (NSException *e) {}
+            if ([sec isEqualToString:kZaloSectionID]) {
+                NSString *nid = nil;
+                @try { nid = [req valueForKey:@"notificationIdentifier"]; } @catch (NSException *e) {}
+                if (nid) {
+                    @synchronized(sUserDismissedNotificationIDs) {
+                        [sUserDismissedNotificationIDs addObject:nid];
+                    }
+                }
+            }
+        }
     }
 
-    [self zk_destination:destination requestsClearingNotificationRequests:requests];
+    t_isUserClearing = YES;
+    @try {
+        [self zk_destination:destination requestsClearingNotificationRequests:requests fromDestinations:dests];
+    } @finally {
+        t_isUserClearing = NO;
+    }
 }
 
 @end
 
 // ==========================================
-// 2. HOOK BBServer (BulletinBoard)
-// (Tầng kết nối giữa usernoted và SpringBoard)
+// 4. HOOK BBServer (BulletinBoard)
+// Chặn lệnh rút thông báo từ tầng BulletinBoard
 // ==========================================
 @interface ZKHook_BBServer : NSObject
 @end
 
 @implementation ZKHook_BBServer
 
-- (void)zk_publishBulletin:(id)bulletin destinations:(unsigned long long)destinations {
-    NSString *secId = nil;
-    @try { secId = [bulletin valueForKey:@"sectionID"]; } @catch (NSException *e) {}
-
-    if ([secId isEqualToString:kZaloSectionID]) {
-        NSString *bId = nil;
-        NSString *recId = nil;
-        NSDate *date = nil;
-        @try {
-            bId = [bulletin valueForKey:@"bulletinID"];
-            recId = [bulletin valueForKey:@"recordID"];
-            date = [bulletin valueForKey:@"date"];
-        } @catch (NSException *e) {}
-
-        ZKLog(@"BB_PUBLISH", @"BBServer publishBulletin for Zalo: bId=%@ recId=%@ date=%@ dest=%llu",
-              bId, recId, date, destinations);
+- (void)zk_withdrawBulletinsWithRecordID:(NSString *)recordID forSectionID:(NSString *)sectionID {
+    if ([sectionID isEqualToString:kZaloSectionID]) {
+        if (!t_isUserClearing) {
+            ZKLog(@"BB_BLOCK", @"[BLOCKED] BBServer withdrawBulletinsWithRecordID: %@ for section: %@", recordID, sectionID);
+            return;
+        }
+        ZKLog(@"BB_ALLOW", @"[ALLOWED] BBServer withdrawBulletinsWithRecordID: %@ (user cleared)", recordID);
     }
-
-    [self zk_publishBulletin:bulletin destinations:destinations];
+    [self zk_withdrawBulletinsWithRecordID:recordID forSectionID:sectionID];
 }
 
 - (void)zk_withdrawBulletinRequestsWithBulletinID:(NSString *)bulletinID {
-    ZKLog(@"BB_WITHDRAW_ID", @"BBServer withdrawBulletinRequestsWithBulletinID: %@\n  [Caller]\n      %@",
-          bulletinID, ZKGetCallerTrace());
-    [self zk_withdrawBulletinRequestsWithBulletinID:bulletinID];
-}
-
-- (void)zk_withdrawBulletinsWithRecordID:(NSString *)recordID forSectionID:(NSString *)sectionID {
-    if ([sectionID isEqualToString:kZaloSectionID]) {
-        ZKLog(@"BB_WITHDRAW_RECORD", @"BBServer withdrawBulletinsWithRecordID: %@ for section: %@\n  [Caller]\n      %@",
-              recordID, sectionID, ZKGetCallerTrace());
+    if (!t_isUserClearing) {
+        ZKLog(@"BB_BLOCK_ID", @"[SUPPRESS] BBServer withdrawBulletinRequestsWithBulletinID: %@", bulletinID);
     }
-    [self zk_withdrawBulletinsWithRecordID:recordID forSectionID:sectionID];
+    [self zk_withdrawBulletinRequestsWithBulletinID:bulletinID];
 }
 
 @end
 
 // ==========================================
-// 3. HOOK SBApplication / SBLeafIcon (BADGE)
+// 5. HOOK SBApplication (Icon Badge)
+// Giữ số badge theo số thông báo Zalo thực tế còn lưu, không cho Zalo tự reset về 0
 // ==========================================
 @interface ZKHook_SBApplication : NSObject
 @end
@@ -335,8 +463,17 @@ static NSString *ZKGetCallerTrace(void) {
     @try { bundleId = [self valueForKey:@"bundleIdentifier"]; } @catch (NSException *e) {}
 
     if ([bundleId isEqualToString:kZaloSectionID]) {
-        ZKLog(@"BADGE_SET", @"SBApplication setBadgeValue for Zalo: value=%@\n  [Caller]\n      %@",
-              badgeValue, ZKGetCallerTrace());
+        ZKInitSets();
+        NSUInteger activeCount = 0;
+        @synchronized(sActiveZaloNotificationIDs) {
+            activeCount = sActiveZaloNotificationIDs.count;
+        }
+
+        // Nếu Zalo cố xóa badge về 0 / nil nhưng ta vẫn còn thông báo chưa đọc trên lockscreen:
+        if ((!badgeValue || [badgeValue isEqual:@0] || [badgeValue isEqual:@"0"] || [badgeValue isEqual:@""]) && activeCount > 0) {
+            ZKLog(@"BADGE_OVERRIDE", @"Zalo tried to reset badge to 0, overridden with activeCount=%lu", (unsigned long)activeCount);
+            badgeValue = [NSNumber numberWithUnsignedInteger:activeCount];
+        }
     }
 
     [self zk_setBadgeValue:badgeValue];
@@ -345,17 +482,38 @@ static NSString *ZKGetCallerTrace(void) {
 @end
 
 // ==========================================
-// 4. CONSTRUCTOR (KHỞI ĐỘNG TRONG SPRINGBOARD)
+// 6. CONSTRUCTOR (Nạp vào SpringBoard)
 // ==========================================
-__attribute__((constructor)) static void initZaloKeepNotifProbe() {
+__attribute__((constructor)) static void initZaloKeepNotif() {
     @autoreleasepool {
         ZKLog(@"INIT", @"=======================================================");
-        ZKLog(@"INIT", @"ZaloKeepNotif (Phase 0: Probe) successfully loaded into SpringBoard!");
-        ZKLog(@"INIT", @"Target: iOS 16.5 Dopamine roothide (iphoneos-arm64e)");
-        ZKLog(@"INIT", @"Log file destination: %@", ZKGetLogPath());
+        ZKLog(@"INIT", @"ZaloKeepNotif (Phase 1: Persistent Lockscreen) Loaded!");
+        ZKLog(@"INIT", @"Target: iOS 16.5 Dopamine RootHide (arm64e)");
+        ZKLog(@"INIT", @"Section: %@", kZaloSectionID);
         ZKLog(@"INIT", @"=======================================================");
 
-        // 1. Hook NCNotificationDispatcher
+        // 1. Hook NCNotificationAction
+        Class actionClass = objc_getClass("NCNotificationAction");
+        if (actionClass) {
+            SwizzleInstanceMethod(actionClass,
+                                  @selector(shouldDismissNotification),
+                                  @selector(zk_shouldDismissNotification));
+            ZKLog(@"INIT", @"Hooked NCNotificationAction shouldDismissNotification");
+        }
+
+        // 2. Hook NCNotificationOptions
+        Class optionsClass = objc_getClass("NCNotificationOptions");
+        if (optionsClass) {
+            SwizzleInstanceMethod(optionsClass,
+                                  @selector(dismissAutomatically),
+                                  @selector(zk_dismissAutomatically));
+            SwizzleInstanceMethod(optionsClass,
+                                  @selector(lockScreenPersistence),
+                                  @selector(zk_lockScreenPersistence));
+            ZKLog(@"INIT", @"Hooked NCNotificationOptions dismissAutomatically & lockScreenPersistence");
+        }
+
+        // 3. Hook NCNotificationDispatcher
         Class dispClass = objc_getClass("NCNotificationDispatcher");
         if (dispClass) {
             SwizzleInstanceMethod(dispClass,
@@ -376,29 +534,25 @@ __attribute__((constructor)) static void initZaloKeepNotifProbe() {
             SwizzleInstanceMethod(dispClass,
                                   @selector(destination:requestsClearingNotificationRequests:),
                                   @selector(zk_destination:requestsClearingNotificationRequests:));
+            SwizzleInstanceMethod(dispClass,
+                                  @selector(destination:requestsClearingNotificationRequests:fromDestinations:),
+                                  @selector(zk_destination:requestsClearingNotificationRequests:fromDestinations:));
             ZKLog(@"INIT", @"Hooked NCNotificationDispatcher successfully.");
-        } else {
-            ZKLog(@"INIT", @"WARNING: NCNotificationDispatcher not found!");
         }
 
-        // 2. Hook BBServer
+        // 4. Hook BBServer
         Class bbServerClass = objc_getClass("BBServer");
         if (bbServerClass) {
             SwizzleInstanceMethod(bbServerClass,
-                                  @selector(publishBulletin:destinations:),
-                                  @selector(zk_publishBulletin:destinations:));
+                                  @selector(withdrawBulletinsWithRecordID:forSectionID:),
+                                  @selector(zk_withdrawBulletinsWithRecordID:forSectionID:));
             SwizzleInstanceMethod(bbServerClass,
                                   @selector(withdrawBulletinRequestsWithBulletinID:),
                                   @selector(zk_withdrawBulletinRequestsWithBulletinID:));
-            SwizzleInstanceMethod(bbServerClass,
-                                  @selector(withdrawBulletinsWithRecordID:forSectionID:),
-                                  @selector(zk_withdrawBulletinsWithRecordID:forSectionID:));
             ZKLog(@"INIT", @"Hooked BBServer successfully.");
-        } else {
-            ZKLog(@"INIT", @"Note: BBServer not present in this process context.");
         }
 
-        // 3. Hook SBApplication
+        // 5. Hook SBApplication
         Class appClass = objc_getClass("SBApplication");
         if (appClass) {
             SwizzleInstanceMethod(appClass,
