@@ -1,9 +1,9 @@
 Package: com.vtt.zalokeepnotif
 Name: ZaloKeepNotif
-Version: 0.1.0-probe
+Version: 0.2.0-persistent
 Architecture: iphoneos-arm64e
-Description: Zalo persistent notification probe for iOS 16.5 SpringBoard (Phase 0)
-Maintainer: vtt
-Author: vtt
+Description: Keep Zalo notifications persistent on iOS 16 lockscreen until user explicitly clears them
+Maintainer: VTT
+Author: VTT
 Section: Tweaks
 Depends: ellekit (>= 1.0)
