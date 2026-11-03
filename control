@@ -1,10 +1,9 @@
-Package: com.vtt.zalopersistentnotif
-Name: ZaloPersistentNotif
-Depends: mobilesubstrate
-Version: 1.0.0
-Architecture: iphoneos-arm
-Description: Keeps Zalo notifications on lock screen and notification center
-Maintainer: LOCKE
-Author: LOCKE
+Package: com.vtt.zalokeepnotif
+Name: ZaloKeepNotif
+Version: 0.1.0-probe
+Architecture: iphoneos-arm64e
+Description: Zalo persistent notification probe for iOS 16.5 SpringBoard (Phase 0)
+Maintainer: vtt
+Author: vtt
 Section: Tweaks
-
+Depends: ellekit (>= 1.0)
