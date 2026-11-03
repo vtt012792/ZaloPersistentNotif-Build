@@ -1,4 +1,4 @@
-name: Build ZaloPersistentNotif
+name: Build ZaloKeepNotif Roothide
 
 on:
   workflow_dispatch:
@@ -15,7 +15,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang lld llvm xz-utils
+          sudo apt-get install -y clang lld llvm xz-utils perl git make curl fakeroot dpkg-dev
 
       - name: Install ldid
         run: |
@@ -25,31 +25,23 @@ jobs:
             sudo mv ldid /usr/local/bin/
           fi
 
-      - name: Download iOS SDK
+      - name: Setup Roothide Theos
         run: |
-          git clone --depth=1 https://github.com/theos/sdks /tmp/sdks
-          SDK=$(find /tmp/sdks -name "iPhoneOS*.sdk" -type d | sort -V | tail -n 1)
-          echo "Found SDK: $SDK"
-          echo "SDK_PATH=$SDK" >> $GITHUB_ENV
+          git clone --recursive https://github.com/roothide/theos.git /tmp/theos
+          git clone --depth=1 https://github.com/theos/sdks.git /tmp/sdks
+          mkdir -p /tmp/theos/sdks
+          cp -r /tmp/sdks/iPhoneOS16.5.sdk /tmp/theos/sdks/ || cp -r /tmp/sdks/*.sdk /tmp/theos/sdks/
+          echo "THEOS=/tmp/theos" >> $GITHUB_ENV
 
-      - name: Compile Dylib
+      - name: Build Roothide Deb Package
         run: |
-          clang -target arm64-apple-ios14.0 \
-            -fuse-ld=lld \
-            -isysroot $SDK_PATH \
-            -shared -fobjc-arc -O2 \
-            -framework Foundation -framework UIKit -framework UserNotifications \
-            ZaloPersistentNotif.m -o ZaloPersistentNotif.dylib
+          export THEOS=/tmp/theos
+          make clean
+          make package THEOS_PACKAGE_SCHEME=roothide FINALPACKAGE=1
+          ls -la packages/
 
-          if command -v ldid >/dev/null 2>&1; then
-            ldid -S ZaloPersistentNotif.dylib || true
-          fi
-
-          ls -lh ZaloPersistentNotif.dylib
-          file ZaloPersistentNotif.dylib || true
-
-      - name: Upload Dylib Artifact
+      - name: Upload Deb Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ZaloPersistentNotif-Tweak
-          path: ZaloPersistentNotif.dylib
+          name: ZaloKeepNotif-Roothide-Deb
+          path: packages/*.deb
