@@ -1,12 +1,13 @@
-TARGET := iphone:clang:latest:14.0
-ARCHS := arm64 arm64e
+TARGET := iphone:clang:16.5:15.0
+ARCHS := arm64e
 
 include $(THEOS)/makefiles/common.mk
 
-TWEAK_NAME = ZaloPersistentNotif
+TWEAK_NAME = ZaloKeepNotif
 
-ZaloPersistentNotif_FILES = ZaloPersistentNotif.m
-ZaloPersistentNotif_CFLAGS = -fobjc-arc -Wno-error
-ZaloPersistentNotif_FRAMEWORKS = UIKit Foundation UserNotifications
+ZaloKeepNotif_FILES = Tweak.m
+ZaloKeepNotif_CFLAGS = -fobjc-arc -Wno-error -Wno-unused-variable -Wno-unused-function
+ZaloKeepNotif_FRAMEWORKS = Foundation UIKit
+ZaloKeepNotif_PRIVATE_FRAMEWORKS = UserNotificationsKit BulletinBoard
 
 include $(THEOS_MAKE_PATH)/tweak.mk
