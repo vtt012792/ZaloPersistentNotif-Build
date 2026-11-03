@@ -15,7 +15,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang lld llvm xz-utils perl git make curl fakeroot dpkg-dev
+          sudo apt-get install -y clang lld llvm xz-utils perl git make curl fakeroot dpkg-dev rsync zip
 
       - name: Install ldid
         run: |
@@ -25,9 +25,11 @@ jobs:
             sudo mv ldid /usr/local/bin/
           fi
 
-      - name: Setup Roothide Theos
+      - name: Setup Roothide Theos and Toolchain
         run: |
           git clone --recursive https://github.com/roothide/theos.git /tmp/theos
+          mkdir -p /tmp/theos/toolchain
+          curl -sL https://github.com/L1ghtmann/llvm-project/releases/download/test-210562a/iOSToolchain-x86_64.tar.xz | tar -xJvf - -C /tmp/theos/toolchain/
           git clone --depth=1 https://github.com/theos/sdks.git /tmp/sdks
           mkdir -p /tmp/theos/sdks
           cp -r /tmp/sdks/iPhoneOS16.5.sdk /tmp/theos/sdks/ || cp -r /tmp/sdks/*.sdk /tmp/theos/sdks/
