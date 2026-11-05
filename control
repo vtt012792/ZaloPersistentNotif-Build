@@ -1,9 +1,9 @@
-Package: com.vtt.zalokeepnotif
+Package: com.vtt012792.zalokeepnotif
 Name: ZaloKeepNotif
-Version: 0.2.0-persistent
-Architecture: iphoneos-arm64e
-Description: Keep Zalo notifications persistent on iOS 16 lockscreen until user explicitly clears them
-Maintainer: VTT
-Author: VTT
+Version: 1.2.2
+Architecture: iphoneos-arm64
+Description: Giu thong bao Zalo tren lockscreen khi nhan mo app, chi mat khi nguoi dung tu xoa.
+Maintainer: vtt012792
+Author: vtt012792
 Section: Tweaks
-Depends: ellekit (>= 1.0)
+Depends: mobilesubstrate, firmware (>= 16.1)
