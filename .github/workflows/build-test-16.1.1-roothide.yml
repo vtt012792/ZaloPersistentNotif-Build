@@ -1,0 +1,130 @@
+# ZaloKeepNotif 1.2.2 — iOS 16.1.1, Roothide
+# Test trên máy ảo GitHub (ubuntu-24.04, Linux).
+#
+# Workflow này KHÔNG chạy được iPhone thật / iOS Simulator
+# (Simulator chỉ có trên macOS). Nó kiểm tra được:
+#  1. Build sạch bằng clang 18 + iPhoneOS16.5.sdk, target arm64-apple-ios16.1
+#  2. Dylib arm64, minos 16.1, có LC_CODE_SIGNATURE adhoc, có constructor
+#  3. Đủ selector/symbol của 16 hook SpringBoard + 3 hook daemon + re-add
+#  4. .deb đúng đường dẫn Roothide /var/jb/..., plist filter
+#     Zalo + SpringBoard + Executables=usernotificationsd
+#  5. Logic test 10/10 + mô phỏng flow iOS 9/9 (sim/sim_ios.py):
+#     v1.2 tap giữ noti, v1.1 tap mất, vuốt xóa / clear-all vẫn mất
+# Bất kỳ bước nào FAIL thì cả job FAIL, không upload .deb dùng được.
+#
+# Cách dùng: push file này lên repo, vào Actions -> chạy workflow,
+# hoặc nó tự chạy khi push lên main/dev. Xem kết quả ở Artifacts.
+
+name: Build and Test ZaloKeepNotif 1.2.2 (iOS 16.1.1, Roothide)
+
+on:
+  push:
+    branches: [main, dev]
+    paths:
+      - 'Tweak.m'
+      - 'Makefile'
+      - 'control'
+      - 'ZaloKeepNotif.plist'
+      - 'build.sh'
+      - 'test_v2.sh'
+      - 'sim/**'
+      - '.github/workflows/build-test-16.1.1-roothide.yml'
+  pull_request:
+  workflow_dispatch:
+
+env:
+  VERSION: "1.2.2"
+  MIN_IOS: "16.1"
+  DEB_NAME: "com.vtt012792.zalokeepnotif_1.2.2_iphoneos-arm64.deb"
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang-18 lld-18 llvm-18 dpkg-dev git curl xz-utils libssl-dev python3
+          # build.sh / test_v2.sh gọi lipo, llvm-objdump-18, llvm-nm-18
+          sudo ln -sf /usr/bin/llvm-lipo-18 /usr/local/bin/lipo || true
+          clang --version
+          lld --version || ld.lld-18 --version
+          dpkg-deb --version | head -n 1
+
+      - name: Check Roothide packaging (fail fast)
+        run: |
+          set -euo pipefail
+          grep -q "THEOS_PACKAGE_SCHEME = roothide" Makefile
+          grep -q "Version: 1.2.2" control
+          grep -q "firmware (>= 16.1)" control
+          grep -q "com.zing.zalo" ZaloKeepNotif.plist
+          grep -q "com.apple.springboard" ZaloKeepNotif.plist
+          grep -q "usernotificationsd" ZaloKeepNotif.plist
+          grep -q "Executables" ZaloKeepNotif.plist
+          echo "Roothide checks OK: scheme=roothide, version=1.2.2, plist has Zalo/SpringBoard/usernotificationsd"
+
+      - name: Build zsign (adhoc signer)
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/zhlynn/zsign.git /tmp/zsign
+          make -C /tmp/zsign/build/linux -j4
+          sudo cp /tmp/zsign/bin/zsign /usr/local/bin/zsign
+          zsign -v || true
+
+      - name: Build .deb (iOS 16.1.1)
+        run: |
+          set -euo pipefail
+          bash build.sh 2>&1 | tee /tmp/build.log
+          test -f "packages/${DEB_NAME}"
+
+      - name: Verify dylib + .deb
+        run: |
+          set -euo pipefail
+          DYLIB=build/ZaloKeepNotif.dylib
+          test -f "$DYLIB"
+          llvm-objdump-18 --macho --all-headers "$DYLIB" | grep -A5 "LC_BUILD_VERSION" | grep -q "minos 16.1"
+          llvm-objdump-18 --macho --all-headers "$DYLIB" | grep -q "LC_CODE_SIGNATURE"
+          llvm-objdump-18 --macho --all-headers "$DYLIB" | grep -q "__mod_init_func"
+          # arm64, không phải arm64e kép
+          llvm-lipo-18 -info "$DYLIB" | grep -q "arm64"
+          dpkg-deb --contents "packages/${DEB_NAME}" | grep -q "var/jb/Library/MobileSubstrate/DynamicLibraries/ZaloKeepNotif.dylib"
+          dpkg-deb --contents "packages/${DEB_NAME}" | grep -q "var/jb/Library/MobileSubstrate/DynamicLibraries/ZaloKeepNotif.plist"
+          dpkg-deb --info "packages/${DEB_NAME}" | grep -q "Version: 1.2.2"
+          echo "dylib + .deb checks OK: arm64, minos 16.1, signed, Roothide path"
+
+      - name: Run test_v2.sh (60 checks)
+        run: |
+          set -euo pipefail
+          bash test_v2.sh 2>&1 | tee /tmp/test_v2.log
+          grep -q "ALL PASS" /tmp/test_v2.log
+
+      - name: Run iOS flow simulation (sim/sim_ios.py, 9/9)
+        run: |
+          set -euo pipefail
+          python3 sim/sim_ios.py 2>&1 | tee /tmp/sim.log
+          grep -q "9/9 PASS" /tmp/sim.log
+          grep -q "daemon: BLOCKED UNS.withdraw Zalo" /tmp/sim.log
+
+      - name: Upload .deb
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ZaloKeepNotif-1.2.2-ios16.1.1-roothide-deb
+          path: packages/*.deb
+          retention-days: 7
+
+      - name: Upload logs (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ZaloKeepNotif-1.2.2-test-logs
+          path: |
+            /tmp/build.log
+            /tmp/test_v2.log
+            /tmp/sim.log
+          retention-days: 7
